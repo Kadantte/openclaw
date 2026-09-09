@@ -1,6 +1,7 @@
+// Node screen recording command: invokes screen.record and writes returned media locally.
 import type { Command } from "commander";
-import { randomIdempotencyKey } from "../../gateway/call.js";
 import { defaultRuntime } from "../../runtime.js";
+import { shortenHomePath } from "../../utils.js";
 import {
   parseScreenRecordPayload,
   screenRecordTempPath,
@@ -8,10 +9,18 @@ import {
 } from "../nodes-screen.js";
 import { parseDurationMs } from "../parse-duration.js";
 import { runNodesCommand } from "./cli-utils.js";
-import { callGatewayCli, nodesCallOpts, resolveNodeId } from "./rpc.js";
+import {
+  buildNodeInvokeParams,
+  callNodesGatewayCli,
+  nodesCallOpts,
+  parseOptionalNodeFiniteNumber,
+  parseOptionalNodeNonNegativeInteger,
+  parseOptionalNodePositiveInteger,
+  resolveCliNodeId,
+} from "./rpc.js";
 import type { NodesRpcOpts } from "./types.js";
-import { shortenHomePath } from "../../utils.js";
 
+/** Register node screen recording commands. */
 export function registerNodesScreenCommands(nodes: Command) {
   const screen = nodes
     .command("screen")
@@ -20,7 +29,7 @@ export function registerNodesScreenCommands(nodes: Command) {
   nodesCallOpts(
     screen
       .command("record")
-      .description("Capture a short screen recording from a node (prints MEDIA:<path>)")
+      .description("Capture a short screen recording from a node (prints the saved path)")
       .requiredOption("--node <idOrNameOrIp>", "Node id, name, or IP")
       .option("--screen <index>", "Screen index (0 = primary)", "0")
       .option("--duration <ms|10s>", "Clip duration (ms or 10s)", "10000")
@@ -30,15 +39,18 @@ export function registerNodesScreenCommands(nodes: Command) {
       .option("--invoke-timeout <ms>", "Node invoke timeout in ms (default 120000)", "120000")
       .action(async (opts: NodesRpcOpts & { out?: string }) => {
         await runNodesCommand("screen record", async () => {
-          const nodeId = await resolveNodeId(opts, String(opts.node ?? ""));
           const durationMs = parseDurationMs(opts.duration ?? "");
-          const screenIndex = Number.parseInt(String(opts.screen ?? "0"), 10);
-          const fps = Number.parseFloat(String(opts.fps ?? "10"));
-          const timeoutMs = opts.invokeTimeout
-            ? Number.parseInt(String(opts.invokeTimeout), 10)
-            : undefined;
+          const screenIndex = parseOptionalNodeNonNegativeInteger(opts.screen ?? "0", "--screen");
+          const fps = parseOptionalNodeFiniteNumber(opts.fps ?? "10", "--fps", {
+            minExclusive: 0,
+          });
+          const timeoutMs = parseOptionalNodePositiveInteger(
+            opts.invokeTimeout,
+            "--invoke-timeout",
+          );
+          const nodeId = await resolveCliNodeId(opts, opts.node ?? "");
 
-          const invokeParams: Record<string, unknown> = {
+          const invokeParams = buildNodeInvokeParams({
             nodeId,
             command: "screen.record",
             params: {
@@ -48,37 +60,28 @@ export function registerNodesScreenCommands(nodes: Command) {
               format: "mp4",
               includeAudio: opts.audio !== false,
             },
-            idempotencyKey: randomIdempotencyKey(),
-          };
-          if (typeof timeoutMs === "number" && Number.isFinite(timeoutMs)) {
-            invokeParams.timeoutMs = timeoutMs;
-          }
+            timeoutMs,
+          });
 
-          const raw = (await callGatewayCli("node.invoke", opts, invokeParams)) as unknown;
+          const raw = await callNodesGatewayCli("node.invoke", opts, invokeParams);
           const res = typeof raw === "object" && raw !== null ? (raw as { payload?: unknown }) : {};
           const parsed = parseScreenRecordPayload(res.payload);
           const filePath = opts.out ?? screenRecordTempPath({ ext: parsed.format || "mp4" });
           const written = await writeScreenRecordToFile(filePath, parsed.base64);
 
           if (opts.json) {
-            defaultRuntime.log(
-              JSON.stringify(
-                {
-                  file: {
-                    path: written.path,
-                    durationMs: parsed.durationMs,
-                    fps: parsed.fps,
-                    screenIndex: parsed.screenIndex,
-                    hasAudio: parsed.hasAudio,
-                  },
-                },
-                null,
-                2,
-              ),
-            );
+            defaultRuntime.writeJson({
+              file: {
+                path: written.path,
+                durationMs: parsed.durationMs,
+                fps: parsed.fps,
+                screenIndex: parsed.screenIndex,
+                hasAudio: parsed.hasAudio,
+              },
+            });
             return;
           }
-          defaultRuntime.log(`MEDIA:${shortenHomePath(written.path)}`);
+          defaultRuntime.log(shortenHomePath(written.path));
         });
       }),
     { timeoutMs: 180_000 },

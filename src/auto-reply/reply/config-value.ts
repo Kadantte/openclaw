@@ -1,9 +1,12 @@
+// Parses chat-provided config values into typed booleans, numbers, and strings.
 export function parseConfigValue(raw: string): {
   value?: unknown;
   error?: string;
 } {
   const trimmed = raw.trim();
-  if (!trimmed) return { error: "Missing value." };
+  if (!trimmed) {
+    return { error: "Missing value." };
+  }
 
   if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
     try {
@@ -13,13 +16,21 @@ export function parseConfigValue(raw: string): {
     }
   }
 
-  if (trimmed === "true") return { value: true };
-  if (trimmed === "false") return { value: false };
-  if (trimmed === "null") return { value: null };
+  if (trimmed === "true") {
+    return { value: true };
+  }
+  if (trimmed === "false") {
+    return { value: false };
+  }
+  if (trimmed === "null") {
+    return { value: null };
+  }
 
   if (/^-?\d+(\.\d+)?$/.test(trimmed)) {
     const num = Number(trimmed);
-    if (Number.isFinite(num)) return { value: num };
+    if (Number.isFinite(num)) {
+      return { value: num };
+    }
   }
 
   if (

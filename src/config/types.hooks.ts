@@ -1,3 +1,5 @@
+// Defines hook configuration matching and command types.
+import type { InstallRecordBase } from "./types.installs.js";
 export type HookMappingMatch = {
   path?: string;
   source?: string;
@@ -8,28 +10,36 @@ export type HookMappingTransform = {
   export?: string;
 };
 
+export type HookSessionMode = "isolated" | "persistent";
+
 export type HookMappingConfig = {
   id?: string;
   match?: HookMappingMatch;
   action?: "wake" | "agent";
   wakeMode?: "now" | "next-heartbeat";
   name?: string;
+  /** Route this hook to a specific agent (unknown ids fall back to the default agent). */
+  agentId?: string;
   sessionKey?: string;
+  /** Reuse the resolved session key across runs instead of creating a fresh run session. */
+  sessionMode?: HookSessionMode;
   messageTemplate?: string;
   textTemplate?: string;
+  /**
+   * Fan the mapping out over a top-level payload array: one action per element,
+   * with templates/transforms seeing a payload whose array holds only that
+   * element. Example: the gmail preset uses `forEach: "messages"` so batched
+   * pushes dispatch one isolated run per email.
+   */
+  forEach?: string;
   deliver?: boolean;
   /** DANGEROUS: Disable external content safety wrapping for this hook. */
   allowUnsafeExternalContent?: boolean;
-  channel?:
-    | "last"
-    | "whatsapp"
-    | "telegram"
-    | "discord"
-    | "googlechat"
-    | "slack"
-    | "signal"
-    | "imessage"
-    | "msteams";
+  /**
+   * "last" or any runtime channel id (including plugin channels).
+   * Validation against configured/registered channels happens in gateway hooks runtime.
+   */
+  channel?: "last" | (string & {});
   to?: string;
   /** Override model for this hook (provider/model or alias). */
   model?: string;
@@ -69,36 +79,19 @@ export type HooksGmailConfig = {
   thinking?: "off" | "minimal" | "low" | "medium" | "high";
 };
 
-export type InternalHookHandlerConfig = {
-  /** Event key to listen for (e.g., 'command:new', 'session:start') */
-  event: string;
-  /** Path to handler module (absolute or relative to cwd) */
-  module: string;
-  /** Export name from module (default: 'default') */
-  export?: string;
-};
-
 export type HookConfig = {
   enabled?: boolean;
   env?: Record<string, string>;
   [key: string]: unknown;
 };
 
-export type HookInstallRecord = {
-  source: "npm" | "archive" | "path";
-  spec?: string;
-  sourcePath?: string;
-  installPath?: string;
-  version?: string;
-  installedAt?: string;
+export type HookInstallRecord = InstallRecordBase & {
   hooks?: string[];
 };
 
 export type InternalHooksConfig = {
   /** Enable hooks system */
   enabled?: boolean;
-  /** Legacy: List of internal hook handlers to register (still supported) */
-  handlers?: InternalHookHandlerConfig[];
   /** Per-hook configuration overrides */
   entries?: Record<string, HookConfig>;
   /** Load configuration */
@@ -106,15 +99,33 @@ export type InternalHooksConfig = {
     /** Additional hook directories to scan */
     extraDirs?: string[];
   };
-  /** Install records for hook packs or hooks */
-  installs?: Record<string, HookInstallRecord>;
 };
 
 export type HooksConfig = {
   enabled?: boolean;
   path?: string;
   token?: string;
-  maxBodyBytes?: number;
+  /**
+   * Default session key used for hook agent runs when no request/mapping session key is used.
+   * If omitted, OpenClaw generates `hook:<uuid>` per request.
+   */
+  defaultSessionKey?: string;
+  /**
+   * Allow `sessionKey` from external `/hooks/agent` and `/hooks/wake` request payloads.
+   * Default: false.
+   */
+  allowRequestSessionKey?: boolean;
+  /**
+   * Optional allowlist for explicit session keys (request + mapping). Example: ["hook:"].
+   * Empty/omitted means no prefix restriction.
+   */
+  allowedSessionKeyPrefixes?: string[];
+  /**
+   * Restrict hook execution to these effective agent ids, including
+   * default-agent routing when `agentId` is omitted. Omit or include `*` to
+   * allow any agent. Set `[]` to deny all agent routing.
+   */
+  allowedAgentIds?: string[];
   presets?: string[];
   transformsDir?: string;
   mappings?: HookMappingConfig[];

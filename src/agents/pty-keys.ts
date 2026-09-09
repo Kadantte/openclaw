@@ -1,10 +1,19 @@
+/**
+ * Encodes terminal key, hex, literal, and paste inputs into PTY byte
+ * sequences. The encoder handles xterm modifiers and DECCKM application
+ * cursor mode.
+ */
+import { normalizeLowercaseStringOrEmpty } from "@openclaw/normalization-core/string-coerce";
+
 const ESC = "\x1b";
 const CR = "\r";
 const TAB = "\t";
 const BACKSPACE = "\x7f";
 
-export const BRACKETED_PASTE_START = `${ESC}[200~`;
-export const BRACKETED_PASTE_END = `${ESC}[201~`;
+/** Bracketed-paste prefix emitted before pasted text. */
+const BRACKETED_PASTE_START = `${ESC}[200~`;
+/** Bracketed-paste suffix emitted after pasted text. */
+const BRACKETED_PASTE_END = `${ESC}[201~`;
 
 type Modifiers = {
   ctrl: boolean;
@@ -12,9 +21,15 @@ type Modifiers = {
   shift: boolean;
 };
 
-function escapeRegExp(value: string) {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
+/** SS3 sequences for DECCKM application cursor key mode (smkx). */
+const DECCKM_SS3_KEYS: Record<string, string> = {
+  up: `${ESC}OA`,
+  down: `${ESC}OB`,
+  right: `${ESC}OC`,
+  left: `${ESC}OD`,
+  home: `${ESC}OH`,
+  end: `${ESC}OF`,
+};
 
 const namedKeyMap = new Map<string, string>([
   ["enter", CR],
@@ -93,84 +108,116 @@ const modifiableNamedKeys = new Set([
   "dc",
 ]);
 
-export type KeyEncodingRequest = {
+type KeyEncodingRequest = {
   keys?: string[];
   hex?: string[];
   literal?: string;
 };
 
-export type KeyEncodingResult = {
-  data: string;
+type KeyEncodingResult = {
+  data: Buffer;
   warnings: string[];
 };
 
-export function encodeKeySequence(request: KeyEncodingRequest): KeyEncodingResult {
-  const warnings: string[] = [];
-  let data = "";
-
-  if (request.literal) {
-    data += request.literal;
-  }
-
-  if (request.hex?.length) {
-    for (const raw of request.hex) {
-      const byte = parseHexByte(raw);
-      if (byte === null) {
-        warnings.push(`Invalid hex byte: ${raw}`);
-        continue;
+/** True when request keys depend on normal vs application cursor-key mode. */
+export function hasCursorModeSensitiveKeys(request: KeyEncodingRequest): boolean {
+  return (
+    request.keys?.some((raw) => {
+      const token = raw.trim();
+      if (!token) {
+        return false;
       }
-      data += String.fromCharCode(byte);
-    }
-  }
+      const parsed = parseModifiers(token);
+      if (hasAnyModifier(parsed.mods)) {
+        return false;
+      }
+      return normalizeLowercaseStringOrEmpty(parsed.base) in DECCKM_SS3_KEYS;
+    }) ?? false
+  );
+}
 
-  if (request.keys?.length) {
-    for (const token of request.keys) {
-      data += encodeKeyToken(token, warnings);
+/** Encodes literal, hex, and named key tokens into one PTY byte payload. */
+export function encodeKeySequence(
+  request: KeyEncodingRequest,
+  cursorKeyMode?: "normal" | "application",
+): KeyEncodingResult {
+  const warnings: string[] = [];
+  const hexBytes: number[] = [];
+  for (const raw of request.hex ?? []) {
+    const byte = parseHexByte(raw);
+    if (byte === null) {
+      warnings.push(`Invalid hex byte: ${raw}`);
+      continue;
     }
+    hexBytes.push(byte);
   }
-
+  const keys = request.keys
+    ?.map((token) => encodeKeyToken(token, warnings, cursorKeyMode))
+    .join("");
+  // Hex values are already bytes; only text fragments pass through UTF-8 encoding.
+  const data = Buffer.concat([
+    Buffer.from(request.literal ?? ""),
+    Buffer.from(hexBytes),
+    Buffer.from(keys ?? ""),
+  ]);
   return { data, warnings };
 }
 
+/** Wraps pasted text in bracketed-paste markers when enabled. */
 export function encodePaste(text: string, bracketed = true): string {
-  if (!bracketed) return text;
+  if (!bracketed) {
+    return text;
+  }
   return `${BRACKETED_PASTE_START}${text}${BRACKETED_PASTE_END}`;
 }
 
-function encodeKeyToken(raw: string, warnings: string[]): string {
+function encodeKeyToken(
+  raw: string,
+  warnings: string[],
+  cursorKeyMode?: "normal" | "application",
+): string {
   const token = raw.trim();
-  if (!token) return "";
+  if (!token) {
+    return "";
+  }
 
   if (token.length === 2 && token.startsWith("^")) {
-    const ctrl = toCtrlChar(token[1]);
-    if (ctrl) return ctrl;
+    const ctrl = toCtrlChar(token.charAt(1));
+    if (ctrl) {
+      return ctrl;
+    }
   }
 
   const parsed = parseModifiers(token);
   const base = parsed.base;
-  const baseLower = base.toLowerCase();
+  const baseLower = normalizeLowercaseStringOrEmpty(base);
 
   if (baseLower === "tab" && parsed.mods.shift) {
     return `${ESC}[Z`;
   }
 
+  // Handle arrow keys specially based on cursor key mode.
+  // DECCKM only changes unmodified cursor keys; modified keys use xterm modifier scheme.
+  if (
+    modifiableNamedKeys.has(baseLower) &&
+    cursorKeyMode === "application" &&
+    !hasAnyModifier(parsed.mods)
+  ) {
+    const ss3Seq = DECCKM_SS3_KEYS[baseLower];
+    if (ss3Seq) {
+      return ss3Seq;
+    }
+  }
+
   const baseSeq = namedKeyMap.get(baseLower);
   if (baseSeq) {
-    let seq = baseSeq;
     if (modifiableNamedKeys.has(baseLower) && hasAnyModifier(parsed.mods)) {
-      const mod = xtermModifier(parsed.mods);
-      if (mod > 1) {
-        const modified = applyXtermModifier(seq, mod);
-        if (modified) {
-          seq = modified;
-          return seq;
-        }
-      }
+      // Every modifiable named key is a CSI sequence from namedKeyMap.
+      // Bare cursor sequences omit the first parameter; xterm modifiers require it.
+      const parameter = baseSeq.slice(2, -1) || "1";
+      return `${ESC}[${parameter};${xtermModifier(parsed.mods)}${baseSeq.at(-1)}`;
     }
-    if (parsed.mods.alt) {
-      return `${ESC}${seq}`;
-    }
-    return seq;
+    return parsed.mods.alt ? `${ESC}${baseSeq}` : baseSeq;
   }
 
   if (base.length === 1) {
@@ -189,11 +236,16 @@ function parseModifiers(token: string) {
   let sawModifiers = false;
 
   while (rest.length > 2 && rest[1] === "-") {
-    const mod = rest[0].toLowerCase();
-    if (mod === "c") mods.ctrl = true;
-    else if (mod === "m") mods.alt = true;
-    else if (mod === "s") mods.shift = true;
-    else break;
+    const mod = normalizeLowercaseStringOrEmpty(rest[0]);
+    if (mod === "c") {
+      mods.ctrl = true;
+    } else if (mod === "m") {
+      mods.alt = true;
+    } else if (mod === "s") {
+      mods.shift = true;
+    } else {
+      break;
+    }
     sawModifiers = true;
     rest = rest.slice(2);
   }
@@ -208,7 +260,9 @@ function applyCharModifiers(char: string, mods: Modifiers): string {
   }
   if (mods.ctrl) {
     const ctrl = toCtrlChar(value);
-    if (ctrl) value = ctrl;
+    if (ctrl) {
+      value = ctrl;
+    }
   }
   if (mods.alt) {
     value = `${ESC}${value}`;
@@ -217,8 +271,12 @@ function applyCharModifiers(char: string, mods: Modifiers): string {
 }
 
 function toCtrlChar(char: string): string | null {
-  if (char.length !== 1) return null;
-  if (char === "?") return "\x7f";
+  if (char.length !== 1) {
+    return null;
+  }
+  if (char === "?") {
+    return "\x7f";
+  }
   const code = char.toUpperCase().charCodeAt(0);
   if (code >= 64 && code <= 95) {
     return String.fromCharCode(code & 0x1f);
@@ -228,28 +286,16 @@ function toCtrlChar(char: string): string | null {
 
 function xtermModifier(mods: Modifiers): number {
   let mod = 1;
-  if (mods.shift) mod += 1;
-  if (mods.alt) mod += 2;
-  if (mods.ctrl) mod += 4;
+  if (mods.shift) {
+    mod += 1;
+  }
+  if (mods.alt) {
+    mod += 2;
+  }
+  if (mods.ctrl) {
+    mod += 4;
+  }
   return mod;
-}
-
-function applyXtermModifier(sequence: string, modifier: number): string | null {
-  const escPattern = escapeRegExp(ESC);
-  const csiNumber = new RegExp(`^${escPattern}\\[(\\d+)([~A-Z])$`);
-  const csiArrow = new RegExp(`^${escPattern}\\[(A|B|C|D|H|F)$`);
-
-  const numberMatch = sequence.match(csiNumber);
-  if (numberMatch) {
-    return `${ESC}[${numberMatch[1]};${modifier}${numberMatch[2]}`;
-  }
-
-  const arrowMatch = sequence.match(csiArrow);
-  if (arrowMatch) {
-    return `${ESC}[1;${modifier}${arrowMatch[1]}`;
-  }
-
-  return null;
 }
 
 function hasAnyModifier(mods: Modifiers): boolean {
@@ -257,10 +303,14 @@ function hasAnyModifier(mods: Modifiers): boolean {
 }
 
 function parseHexByte(raw: string): number | null {
-  const trimmed = raw.trim().toLowerCase();
-  const normalized = trimmed.startsWith("0x") ? trimmed.slice(2) : trimmed;
-  if (!/^[0-9a-f]{1,2}$/.test(normalized)) return null;
+  const lower = normalizeLowercaseStringOrEmpty(raw);
+  const normalized = lower.startsWith("0x") ? lower.slice(2) : lower;
+  if (!/^[0-9a-f]{1,2}$/.test(normalized)) {
+    return null;
+  }
   const value = Number.parseInt(normalized, 16);
-  if (Number.isNaN(value) || value < 0 || value > 0xff) return null;
+  if (Number.isNaN(value) || value < 0 || value > 0xff) {
+    return null;
+  }
   return value;
 }

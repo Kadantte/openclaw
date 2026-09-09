@@ -2,10 +2,18 @@
 
 Adds the `lobster` agent tool as an **optional** plugin tool.
 
+## Install
+
+```bash
+openclaw plugins install @openclaw/lobster
+```
+
+Restart the Gateway after installing or updating the plugin.
+
 ## What this is
 
 - Lobster is a standalone workflow shell (typed JSON-first pipelines + approvals/resume).
-- This plugin integrates Lobster with OpenClaw *without core changes*.
+- This plugin integrates Lobster with OpenClaw _without core changes_.
 
 ## Enable
 
@@ -53,28 +61,33 @@ Example (allow only a small set of tools):
       {
         "id": "main",
         "tools": {
-          "allow": [
-            "lobster",
-            "web_fetch",
-            "web_search",
-            "gog",
-            "gh"
-          ],
-          "deny": ["gateway"]
-        }
-      }
-    ]
-  }
+          "allow": ["lobster", "web_fetch", "web_search", "gog", "gh"],
+          "deny": ["gateway"],
+        },
+      },
+    ],
+  },
 }
 ```
 
 Notes:
+
 - If `tools.allow` is omitted or empty, it behaves like "allow everything (except denied)". For a real allowlist, set a **non-empty** `allow`.
 - Tool names depend on which plugins you have installed/enabled.
 
 ## Security
 
-- Runs the `lobster` executable as a local subprocess.
+- Runs Lobster in process via the published `@clawdbot/lobster/core` runtime.
 - Does not manage OAuth/tokens.
 - Uses timeouts, stdout caps, and strict JSON envelope parsing.
-- Prefer an absolute `lobsterPath` in production to avoid PATH hijack.
+
+## Docs
+
+- https://docs.openclaw.ai/tools/lobster
+
+## Package
+
+- Plugin id: `lobster`
+- Tool: `lobster`
+- Package: `@openclaw/lobster`
+- Minimum OpenClaw host: `2026.4.25`

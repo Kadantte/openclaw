@@ -1,18 +1,43 @@
+/** Audits installed daemon service definitions for drift and repair candidates. */
 import fs from "node:fs/promises";
 import path from "node:path";
+import {
+  normalizeLowercaseStringOrEmpty,
+  normalizeOptionalString,
+} from "@openclaw/normalization-core/string-coerce";
+import { normalizeStringEntries } from "@openclaw/normalization-core/string-normalization";
+import { SUPPORTED_NODE_VERSIONS } from "../../node-version.mjs";
+import { resolveInlineCommandMatch } from "../infra/shell-inline-command.js";
+import { POSIX_SHELL_WRAPPERS } from "../infra/shell-wrapper-resolution.js";
+import { parseTcpPort } from "../infra/tcp-port.js";
 import { resolveLaunchAgentPlistPath } from "./launchd.js";
+import { isBunRuntime, isNodeRuntime } from "./runtime-binary.js";
+import { parseKeyValueOutput } from "./runtime-parse.js";
 import {
   isSystemNodePath,
   isVersionManagedNodePath,
+  resolveBunRuntimeInfo,
   resolveSystemNodePath,
 } from "./runtime-paths.js";
-import { getMinimalServicePathPartsFromEnv } from "./service-env.js";
-import { resolveSystemdUserUnitPath } from "./systemd.js";
+import { getMinimalServicePathPartsFromEnv, SERVICE_PROXY_ENV_KEYS } from "./service-env.js";
+import {
+  collectInlineManagedServiceEnvKeys,
+  collectInlineServiceEnvKeys,
+  hasInlineEnvironmentSource,
+  isEnvironmentFileOnlySource,
+  readEnvironmentValueSource,
+} from "./service-managed-env.js";
+import { isNonMinimalServicePathEntry, normalizeServicePathEntry } from "./service-path-policy.js";
+import type { GatewayServiceEnvironmentValueSource } from "./service-types.js";
+import { execSystemctlUser } from "./systemd-exec.js";
+import { resolveSystemdServiceName, resolveSystemdUnitPath } from "./systemd-service-files.js";
+import { parseSystemdEnvAssignments, splitSystemdLogicalLines } from "./systemd-unit.js";
 
 export type GatewayServiceCommand = {
   programArguments: string[];
   workingDirectory?: string;
   environment?: Record<string, string>;
+  environmentValueSources?: Record<string, GatewayServiceEnvironmentValueSource>;
   sourcePath?: string;
 } | null;
 
@@ -20,30 +45,41 @@ export type ServiceConfigIssue = {
   code: string;
   message: string;
   detail?: string;
+  environmentKeys?: string[];
   level?: "recommended" | "aggressive";
 };
 
-export type ServiceConfigAudit = {
-  ok: boolean;
-  issues: ServiceConfigIssue[];
-};
-
+export type ServiceConfigAudit =
+  | { ok: true; issues: ServiceConfigIssue[] }
+  | { ok: false; issues: ServiceConfigIssue[] };
 export const SERVICE_AUDIT_CODES = {
   gatewayCommandMissing: "gateway-command-missing",
   gatewayEntrypointMismatch: "gateway-entrypoint-mismatch",
   gatewayPathMissing: "gateway-path-missing",
   gatewayPathMissingDirs: "gateway-path-missing-dirs",
   gatewayPathNonMinimal: "gateway-path-nonminimal",
+  gatewayTokenEmbedded: "gateway-token-embedded",
+  gatewayPasswordEmbedded: "gateway-password-embedded",
+  gatewayManagedEnvEmbedded: "gateway-managed-env-embedded",
+  gatewayPortMismatch: "gateway-port-mismatch",
+  gatewayProxyEnvEmbedded: "gateway-proxy-env-embedded",
+  gatewayTokenMismatch: "gateway-token-mismatch",
   gatewayRuntimeBun: "gateway-runtime-bun",
+  gatewayRuntimeProbeFailed: "gateway-runtime-probe-failed",
   gatewayRuntimeNodeVersionManager: "gateway-runtime-node-version-manager",
   gatewayRuntimeNodeSystemMissing: "gateway-runtime-node-system-missing",
+  gatewayTokenDrift: "gateway-token-drift",
   launchdKeepAlive: "launchd-keep-alive",
   launchdRunAtLoad: "launchd-run-at-load",
   systemdAfterNetworkOnline: "systemd-after-network-online",
   systemdRestartSec: "systemd-restart-sec",
   systemdWantsNetworkOnline: "systemd-wants-network-online",
+  systemdKillModeProcessOrNone: "systemd-kill-mode-process-or-none",
+  systemdKillModeControlGroup: "systemd-kill-mode-control-group",
+  systemdUnitBackupUnsafe: "systemd-unit-backup-unsafe",
 } as const;
 
+/** Returns whether audit issues require migrating a daemon to a stable Node runtime. */
 export function needsNodeRuntimeMigration(issues: ServiceConfigIssue[]): boolean {
   return issues.some(
     (issue) =>
@@ -56,61 +92,137 @@ function hasGatewaySubcommand(programArguments?: string[]): boolean {
   return Boolean(programArguments?.some((arg) => arg === "gateway"));
 }
 
+const POSIX_SERVICE_INLINE_COMMAND_FLAGS = new Set(["-c"]);
+const POSIX_SERVICE_SHELL_WRAPPERS: ReadonlySet<string> = POSIX_SHELL_WRAPPERS;
+const SYSTEMD_AUDIT_TIMEOUT_MS = 10_000;
+
+function isOpaquePosixShellInlineCommand(programArguments: string[]): boolean {
+  const executable = programArguments[0]?.trim();
+  const shellName = executable ? path.posix.basename(executable).toLowerCase() : "";
+  if (!POSIX_SERVICE_SHELL_WRAPPERS.has(shellName)) {
+    return false;
+  }
+  return (
+    resolveInlineCommandMatch(programArguments, POSIX_SERVICE_INLINE_COMMAND_FLAGS, {
+      allowCombinedC: true,
+    }).command !== null
+  );
+}
+
 function parseSystemdUnit(content: string): {
   after: Set<string>;
   wants: Set<string>;
   restartSec?: string;
+  killMode?: string;
 } {
   const after = new Set<string>();
   const wants = new Set<string>();
   let restartSec: string | undefined;
+  let killMode: string | undefined;
 
-  for (const rawLine of content.split(/\r?\n/)) {
+  // Parse only unit keys relevant to service resilience; this is not a full
+  // systemd parser and intentionally ignores sections.
+  for (const rawLine of splitSystemdLogicalLines(content)) {
     const line = rawLine.trim();
-    if (!line) continue;
-    if (line.startsWith("#") || line.startsWith(";")) continue;
-    if (line.startsWith("[")) continue;
+    if (!line) {
+      continue;
+    }
+    if (line.startsWith("#") || line.startsWith(";")) {
+      continue;
+    }
+    if (line.startsWith("[")) {
+      continue;
+    }
     const idx = line.indexOf("=");
-    if (idx <= 0) continue;
+    if (idx <= 0) {
+      continue;
+    }
     const key = line.slice(0, idx).trim();
     const value = line.slice(idx + 1).trim();
-    if (!value) continue;
-    if (key === "After") {
+    if (!value) {
+      continue;
+    }
+    if (key === "After" || key === "Wants") {
+      const dependencies = key === "After" ? after : wants;
       for (const entry of value.split(/\s+/)) {
-        if (entry) after.add(entry);
-      }
-    } else if (key === "Wants") {
-      for (const entry of value.split(/\s+/)) {
-        if (entry) wants.add(entry);
+        if (entry) {
+          dependencies.add(entry);
+        }
       }
     } else if (key === "RestartSec") {
       restartSec = value;
+    } else if (key === "KillMode") {
+      killMode = value;
     }
   }
 
-  return { after, wants, restartSec };
+  return { after, wants, restartSec, killMode };
 }
 
 function isRestartSecPreferred(value: string | undefined): boolean {
-  if (!value) return false;
-  const parsed = Number.parseFloat(value);
-  if (!Number.isFinite(parsed)) return false;
+  if (!value) {
+    return false;
+  }
+  const parsed = parseSystemdRestartSecSeconds(value);
+  if (parsed === undefined) {
+    return false;
+  }
   return Math.abs(parsed - 5) < 0.01;
+}
+
+function parseSystemdRestartSecSeconds(value: string): number | undefined {
+  const match = value
+    .trim()
+    .match(/^([+-]?(?:\d+(?:\.\d*)?|\.\d+))(?:\s*(?:s|sec|secs|second|seconds))?$/iu);
+  if (!match) {
+    return undefined;
+  }
+  const parsed = Number(match[1]);
+  return Number.isFinite(parsed) ? parsed : undefined;
 }
 
 async function auditSystemdUnit(
   env: Record<string, string | undefined>,
   issues: ServiceConfigIssue[],
+  timeoutMs?: number,
 ) {
-  const unitPath = resolveSystemdUserUnitPath(env);
-  let content = "";
+  const unitPath = resolveSystemdUnitPath(env);
+  await auditSystemdUnitBackup(unitPath, issues);
+  let content;
   try {
     content = await fs.readFile(unitPath, "utf8");
   } catch {
     return;
   }
 
-  const parsed = parseSystemdUnit(content);
+  // The manager owns merged drop-ins and dependency links. Fall back wholesale
+  // to the base unit only when its bounded effective-state query fails.
+  // `systemctl show` still exits 0 for masked and not-found units, with empty
+  // After/Wants and RestartUSec=100ms defaults. Those are not loaded settings.
+  const manager = await execSystemctlUser(
+    env,
+    [
+      "show",
+      `${resolveSystemdServiceName(env)}.service`,
+      "--no-page",
+      "--property",
+      "After,Wants,RestartUSec,KillMode,LoadState",
+    ],
+    timeoutMs && timeoutMs > 0 ? timeoutMs : SYSTEMD_AUDIT_TIMEOUT_MS,
+  );
+  const entries = manager.code === 0 ? parseKeyValueOutput(manager.stdout, "=") : undefined;
+  const loadState = normalizeLowercaseStringOrEmpty(entries?.loadstate);
+  if (loadState && loadState !== "loaded") {
+    return;
+  }
+  const parsed = entries
+    ? {
+        after: new Set(entries.after?.split(/\s+/).filter(Boolean)),
+        wants: new Set(entries.wants?.split(/\s+/).filter(Boolean)),
+        restartSec: entries.restartusec,
+        killMode: entries.killmode,
+      }
+    : parseSystemdUnit(content);
   if (!parsed.after.has("network-online.target")) {
     issues.push({
       code: SERVICE_AUDIT_CODES.systemdAfterNetworkOnline,
@@ -135,6 +247,76 @@ async function auditSystemdUnit(
       level: "recommended",
     });
   }
+  const killMode = normalizeLowercaseStringOrEmpty(parsed.killMode) || "control-group";
+  if (killMode !== "mixed") {
+    issues.push({
+      code:
+        killMode === "process" || killMode === "none"
+          ? SERVICE_AUDIT_CODES.systemdKillModeProcessOrNone
+          : SERVICE_AUDIT_CODES.systemdKillModeControlGroup,
+      message:
+        "KillMode=mixed is required to drain active turns before final service child cleanup; inspect unit and drop-in overrides.",
+      detail: `${unitPath}: ${killMode}`,
+      level: "recommended",
+    });
+  }
+}
+
+async function auditSystemdUnitBackup(unitPath: string, issues: ServiceConfigIssue[]) {
+  const backupPath = `${unitPath}.bak`;
+  let stat;
+  try {
+    stat = await fs.lstat(backupPath);
+  } catch {
+    return;
+  }
+  const mode = stat.mode & 0o777;
+  const embeddedKeys = new Set<string>();
+  let unreadable = false;
+  if (stat.isFile()) {
+    const content = await fs.readFile(backupPath, "utf8").catch(() => {
+      unreadable = true;
+      return "";
+    });
+    for (const rawLine of splitSystemdLogicalLines(content)) {
+      const line = rawLine.trim();
+      const separator = line.indexOf("=");
+      if (separator < 0 || line.slice(0, separator).trim() !== "Environment") {
+        continue;
+      }
+      for (const { key, value } of parseSystemdEnvAssignments(line.slice(separator + 1).trim())) {
+        const normalizedKey = key.toUpperCase();
+        if (
+          value &&
+          (normalizedKey === "OPENCLAW_GATEWAY_TOKEN" ||
+            normalizedKey === "OPENCLAW_GATEWAY_PASSWORD")
+        ) {
+          embeddedKeys.add(normalizedKey);
+        }
+      }
+    }
+  }
+  if (stat.isFile() && !unreadable && embeddedKeys.size === 0 && (mode & 0o077) === 0) {
+    return;
+  }
+  const detail = [
+    backupPath,
+    !stat.isFile() ? "not a regular file" : undefined,
+    unreadable ? "unreadable" : undefined,
+    embeddedKeys.size > 0 ? `embedded keys: ${[...embeddedKeys].toSorted().join(", ")}` : undefined,
+    (mode & 0o077) !== 0 ? `mode: ${mode.toString(8).padStart(3, "0")}` : undefined,
+  ]
+    .filter(Boolean)
+    .join("; ");
+  issues.push({
+    code: SERVICE_AUDIT_CODES.systemdUnitBackupUnsafe,
+    message:
+      embeddedKeys.size > 0
+        ? "Systemd service backup exposes gateway credentials; reinstall the service and rotate the embedded credentials."
+        : "Systemd service backup is unsafe; reinstall the service to replace it.",
+    detail,
+    level: "recommended",
+  });
 }
 
 async function auditLaunchdPlist(
@@ -142,7 +324,7 @@ async function auditLaunchdPlist(
   issues: ServiceConfigIssue[],
 ) {
   const plistPath = resolveLaunchAgentPlistPath(env);
-  let content = "";
+  let content;
   try {
     content = await fs.readFile(plistPath, "utf8");
   } catch {
@@ -170,8 +352,13 @@ async function auditLaunchdPlist(
 }
 
 function auditGatewayCommand(programArguments: string[] | undefined, issues: ServiceConfigIssue[]) {
-  if (!programArguments || programArguments.length === 0) return;
-  if (!hasGatewaySubcommand(programArguments)) {
+  if (!programArguments || programArguments.length === 0) {
+    return;
+  }
+  if (
+    !hasGatewaySubcommand(programArguments) &&
+    !isOpaquePosixShellInlineCommand(programArguments)
+  ) {
     issues.push({
       code: SERVICE_AUDIT_CODES.gatewayCommandMissing,
       message: "Service command does not include the gateway subcommand",
@@ -180,27 +367,188 @@ function auditGatewayCommand(programArguments: string[] | undefined, issues: Ser
   }
 }
 
-function isNodeRuntime(execPath: string): boolean {
-  const base = path.basename(execPath).toLowerCase();
-  return base === "node" || base === "node.exe";
-}
+type GatewayServiceCommandPort =
+  | { kind: "missing" }
+  | { kind: "valid"; port: number }
+  | { kind: "invalid"; raw: string };
 
-function isBunRuntime(execPath: string): boolean {
-  const base = path.basename(execPath).toLowerCase();
-  return base === "bun" || base === "bun.exe";
-}
-
-function getPathModule(platform: NodeJS.Platform) {
-  return platform === "win32" ? path.win32 : path.posix;
-}
-
-function normalizePathEntry(entry: string, platform: NodeJS.Platform): string {
-  const pathModule = getPathModule(platform);
-  const normalized = pathModule.normalize(entry).replaceAll("\\", "/");
-  if (platform === "win32") {
-    return normalized.toLowerCase();
+function parseGatewayPortArg(value: string | undefined): GatewayServiceCommandPort {
+  const raw = value?.trim() ?? "";
+  const port = parseTcpPort(raw);
+  if (port !== null) {
+    return { kind: "valid", port };
   }
-  return normalized;
+  return raw ? { kind: "invalid", raw } : { kind: "missing" };
+}
+
+function readGatewayServiceCommandPortState(
+  programArguments?: string[],
+): GatewayServiceCommandPort {
+  if (!programArguments || programArguments.length === 0) {
+    return { kind: "missing" };
+  }
+  let latest: GatewayServiceCommandPort = { kind: "missing" };
+  for (let index = 0; index < programArguments.length; index += 1) {
+    const arg = programArguments[index];
+    if (arg === "--port") {
+      latest = parseGatewayPortArg(programArguments[index + 1]);
+      index += 1;
+      continue;
+    }
+    if (arg?.startsWith("--port=")) {
+      latest = parseGatewayPortArg(arg.slice("--port=".length));
+    }
+  }
+  return latest;
+}
+
+function auditGatewayServicePort(params: {
+  programArguments: string[] | undefined;
+  issues: ServiceConfigIssue[];
+  expectedPort?: number;
+}) {
+  if (
+    typeof params.expectedPort !== "number" ||
+    !Number.isSafeInteger(params.expectedPort) ||
+    params.expectedPort <= 0 ||
+    params.expectedPort > 65535
+  ) {
+    return;
+  }
+  const servicePort = readGatewayServiceCommandPortState(params.programArguments);
+  if (servicePort.kind === "missing") {
+    return;
+  }
+  if (servicePort.kind === "valid" && servicePort.port === params.expectedPort) {
+    return;
+  }
+  const detail =
+    servicePort.kind === "valid"
+      ? `${servicePort.port} -> ${params.expectedPort}`
+      : `${servicePort.raw} -> ${params.expectedPort}`;
+  params.issues.push({
+    code: SERVICE_AUDIT_CODES.gatewayPortMismatch,
+    message: "Gateway service port does not match current gateway config.",
+    detail,
+    level: "recommended",
+  });
+}
+
+function auditGatewayToken(
+  command: GatewayServiceCommand,
+  issues: ServiceConfigIssue[],
+  expectedGatewayToken?: string,
+) {
+  const serviceToken = readEmbeddedGatewayToken(command);
+  if (!serviceToken) {
+    return;
+  }
+  issues.push({
+    code: SERVICE_AUDIT_CODES.gatewayTokenEmbedded,
+    message: "Gateway service embeds OPENCLAW_GATEWAY_TOKEN and should be reinstalled.",
+    level: "recommended",
+  });
+  const expectedToken = normalizeOptionalString(expectedGatewayToken);
+  if (!expectedToken || serviceToken === expectedToken) {
+    return;
+  }
+  issues.push({
+    code: SERVICE_AUDIT_CODES.gatewayTokenMismatch,
+    message:
+      "Gateway service OPENCLAW_GATEWAY_TOKEN does not match gateway.auth.token in openclaw.json",
+    detail: "service token is stale",
+    level: "recommended",
+  });
+}
+
+function auditGatewayPassword(command: GatewayServiceCommand, issues: ServiceConfigIssue[]) {
+  if (
+    !command?.environment?.OPENCLAW_GATEWAY_PASSWORD?.trim() ||
+    isEnvironmentFileOnlySource(command.environmentValueSources?.OPENCLAW_GATEWAY_PASSWORD)
+  ) {
+    return;
+  }
+  issues.push({
+    code: SERVICE_AUDIT_CODES.gatewayPasswordEmbedded,
+    message: "Gateway service embeds OPENCLAW_GATEWAY_PASSWORD and should be reinstalled.",
+    detail: "Rotate the password after reinstalling because the service definition exposed it.",
+    level: "recommended",
+  });
+}
+
+function auditManagedServiceEnvironment(
+  command: GatewayServiceCommand,
+  issues: ServiceConfigIssue[],
+  expectedManagedServiceEnvKeys?: Iterable<string>,
+) {
+  const inlineKeys = collectInlineManagedServiceEnvKeys(command, expectedManagedServiceEnvKeys);
+  if (inlineKeys.length === 0) {
+    return;
+  }
+  issues.push({
+    code: SERVICE_AUDIT_CODES.gatewayManagedEnvEmbedded,
+    message: "Gateway service embeds managed environment values that should load at runtime.",
+    detail: `inline keys: ${inlineKeys.join(", ")}`,
+    environmentKeys: inlineKeys,
+    level: "recommended",
+  });
+}
+
+function auditProxyServiceEnvironment(
+  command: GatewayServiceCommand,
+  issues: ServiceConfigIssue[],
+) {
+  const inlineKeys = collectInlineServiceEnvKeys(command, SERVICE_PROXY_ENV_KEYS);
+  if (inlineKeys.length === 0) {
+    return;
+  }
+  issues.push({
+    code: SERVICE_AUDIT_CODES.gatewayProxyEnvEmbedded,
+    message: "Gateway service embeds proxy environment values that should not be persisted.",
+    detail: `inline keys: ${inlineKeys.join(", ")}`,
+    environmentKeys: Object.entries(command?.environment ?? {})
+      .filter(
+        ([key, value]) =>
+          value.trim() &&
+          SERVICE_PROXY_ENV_KEYS.some((proxyKey) => proxyKey === key) &&
+          hasInlineEnvironmentSource(
+            readEnvironmentValueSource(command?.environmentValueSources, key),
+          ),
+      )
+      .map(([key]) => key)
+      .toSorted(),
+    level: "recommended",
+  });
+}
+
+export function readEmbeddedGatewayToken(command: GatewayServiceCommand): string | undefined {
+  if (!command) {
+    return undefined;
+  }
+  if (isEnvironmentFileOnlySource(command.environmentValueSources?.OPENCLAW_GATEWAY_TOKEN)) {
+    return undefined;
+  }
+  return normalizeOptionalString(command.environment?.OPENCLAW_GATEWAY_TOKEN);
+}
+
+function getEquivalentMinimalPathEntries(
+  entry: string,
+  platform: NodeJS.Platform,
+  normalizedExpected: Set<string>,
+): string[] {
+  if (platform !== "linux") {
+    return [];
+  }
+  const equivalent = entry.endsWith("/aliases/default/bin")
+    ? `${entry.slice(0, -"/aliases/default/bin".length)}/current/bin`
+    : entry.endsWith("/current/bin")
+      ? `${entry.slice(0, -"/current/bin".length)}/aliases/default/bin`
+      : undefined;
+  if (!equivalent) {
+    return [];
+  }
+  const normalizedEquivalent = normalizeServicePathEntry(equivalent, platform);
+  return normalizedExpected.has(normalizedEquivalent) ? [equivalent] : [];
 }
 
 function auditGatewayServicePath(
@@ -208,8 +556,14 @@ function auditGatewayServicePath(
   issues: ServiceConfigIssue[],
   env: Record<string, string | undefined>,
   platform: NodeJS.Platform,
+  expectedServicePath?: string,
 ) {
-  if (platform === "win32") return;
+  if (!command) {
+    return;
+  }
+  if (platform === "win32") {
+    return;
+  }
   const servicePath = command?.environment?.PATH;
   if (!servicePath) {
     issues.push({
@@ -220,16 +574,26 @@ function auditGatewayServicePath(
     return;
   }
 
-  const expected = getMinimalServicePathPartsFromEnv({ platform, env });
-  const parts = servicePath
-    .split(getPathModule(platform).delimiter)
-    .map((entry) => entry.trim())
-    .filter(Boolean);
-  const normalizedParts = parts.map((entry) => normalizePathEntry(entry, platform));
-  const normalizedExpected = new Set(expected.map((entry) => normalizePathEntry(entry, platform)));
+  const expected = expectedServicePath?.trim()
+    ? normalizeStringEntries(expectedServicePath.split(path.posix.delimiter))
+    : getMinimalServicePathPartsFromEnv({
+        platform,
+        env,
+        includeMissingUserBinDefaults: false,
+      });
+  const parts = normalizeStringEntries(servicePath.split(path.posix.delimiter));
+  const normalizedParts = new Set(parts.map((entry) => normalizeServicePathEntry(entry, platform)));
+  const normalizedExpected = new Set(
+    expected.map((entry) => normalizeServicePathEntry(entry, platform)),
+  );
   const missing = expected.filter((entry) => {
-    const normalized = normalizePathEntry(entry, platform);
-    return !normalizedParts.includes(normalized);
+    const normalized = normalizeServicePathEntry(entry, platform);
+    if (normalizedParts.has(normalized)) {
+      return false;
+    }
+    return !getEquivalentMinimalPathEntries(entry, platform, normalizedExpected).some(
+      (equivalent) => normalizedParts.has(normalizeServicePathEntry(equivalent, platform)),
+    );
   });
   if (missing.length > 0) {
     issues.push({
@@ -240,23 +604,11 @@ function auditGatewayServicePath(
   }
 
   const nonMinimal = parts.filter((entry) => {
-    const normalized = normalizePathEntry(entry, platform);
+    const normalized = normalizeServicePathEntry(entry, platform);
     if (normalizedExpected.has(normalized)) {
       return false;
     }
-    return (
-      normalized.includes("/.nvm/") ||
-      normalized.includes("/.fnm/") ||
-      normalized.includes("/.volta/") ||
-      normalized.includes("/.asdf/") ||
-      normalized.includes("/.n/") ||
-      normalized.includes("/.nodenv/") ||
-      normalized.includes("/.nodebrew/") ||
-      normalized.includes("/nvs/") ||
-      normalized.includes("/.local/share/pnpm/") ||
-      normalized.includes("/pnpm/") ||
-      normalized.endsWith("/pnpm")
-    );
+    return isNonMinimalServicePathEntry(normalized, platform);
   });
   if (nonMinimal.length > 0) {
     issues.push({
@@ -276,19 +628,37 @@ async function auditGatewayRuntime(
   platform: NodeJS.Platform,
 ) {
   const execPath = command?.programArguments?.[0];
-  if (!execPath) return;
-
-  if (isBunRuntime(execPath)) {
-    issues.push({
-      code: SERVICE_AUDIT_CODES.gatewayRuntimeBun,
-      message: "Gateway service uses Bun; Bun is incompatible with WhatsApp + Telegram channels.",
-      detail: execPath,
-      level: "recommended",
-    });
+  if (!execPath) {
     return;
   }
 
-  if (!isNodeRuntime(execPath)) return;
+  if (isBunRuntime(execPath)) {
+    const runtime = await resolveBunRuntimeInfo(execPath);
+    if (runtime.status !== "supported") {
+      issues.push({
+        code:
+          runtime.status === "probe-failed"
+            ? SERVICE_AUDIT_CODES.gatewayRuntimeProbeFailed
+            : SERVICE_AUDIT_CODES.gatewayRuntimeBun,
+        message:
+          runtime.status === "probe-failed"
+            ? "Gateway service Bun runtime probe failed."
+            : "Gateway service uses an unsupported Bun runtime; Bun 1.4+ with WAL-reset-safe node:sqlite is required.",
+        detail:
+          runtime.status === "probe-failed"
+            ? runtime.error.message
+            : runtime.sqliteSelectionError
+              ? `${execPath}: ${runtime.sqliteSelectionError}`
+              : execPath,
+        level: "recommended",
+      });
+    }
+    return;
+  }
+
+  if (!isNodeRuntime(execPath)) {
+    return;
+  }
 
   if (isVersionManagedNodePath(execPath, platform)) {
     issues.push({
@@ -302,8 +672,7 @@ async function auditGatewayRuntime(
       if (!systemNode) {
         issues.push({
           code: SERVICE_AUDIT_CODES.gatewayRuntimeNodeSystemMissing,
-          message:
-            "System Node 22+ not found; install it before migrating away from version managers.",
+          message: `System Node ${SUPPORTED_NODE_VERSIONS} not found; install it before migrating away from version managers.`,
           level: "recommended",
         });
       }
@@ -311,23 +680,66 @@ async function auditGatewayRuntime(
   }
 }
 
+/**
+ * Check if the service's embedded token differs from the config file token.
+ * Returns an issue if drift is detected (service will use old token after restart).
+ * The invoking CLI selects recovery advice for its installation.
+ */
+export function checkTokenDrift(params: {
+  serviceToken: string | undefined;
+  configToken: string | undefined;
+}): ServiceConfigIssue | null {
+  const serviceToken = normalizeOptionalString(params.serviceToken);
+  const configToken = normalizeOptionalString(params.configToken);
+
+  // Tokenless service units are canonical; no drift to report.
+  if (!serviceToken) {
+    return null;
+  }
+
+  if (configToken && serviceToken !== configToken) {
+    return {
+      code: SERVICE_AUDIT_CODES.gatewayTokenDrift,
+      message:
+        "Config token differs from service token. The daemon will use the old token after restart.",
+      level: "recommended",
+    };
+  }
+
+  return null;
+}
+
 export async function auditGatewayServiceConfig(params: {
   env: Record<string, string | undefined>;
   command: GatewayServiceCommand;
   platform?: NodeJS.Platform;
+  expectedGatewayToken?: string;
+  expectedManagedServiceEnvKeys?: Iterable<string>;
+  expectedServicePath?: string;
+  expectedPort?: number;
+  timeoutMs?: number;
 }): Promise<ServiceConfigAudit> {
   const issues: ServiceConfigIssue[] = [];
   const platform = params.platform ?? process.platform;
 
   auditGatewayCommand(params.command?.programArguments, issues);
-  auditGatewayServicePath(params.command, issues, params.env, platform);
+  auditGatewayServicePort({
+    programArguments: params.command?.programArguments,
+    issues,
+    expectedPort: params.expectedPort,
+  });
+  auditManagedServiceEnvironment(params.command, issues, params.expectedManagedServiceEnvKeys);
+  auditProxyServiceEnvironment(params.command, issues);
+  auditGatewayToken(params.command, issues, params.expectedGatewayToken);
+  auditGatewayPassword(params.command, issues);
+  auditGatewayServicePath(params.command, issues, params.env, platform, params.expectedServicePath);
   await auditGatewayRuntime(params.env, params.command, issues, platform);
 
   if (platform === "linux") {
-    await auditSystemdUnit(params.env, issues);
+    await auditSystemdUnit(params.env, issues, params.timeoutMs);
   } else if (platform === "darwin") {
     await auditLaunchdPlist(params.env, issues);
   }
 
-  return { ok: issues.length === 0, issues };
+  return issues.length === 0 ? { ok: true, issues } : { ok: false, issues };
 }

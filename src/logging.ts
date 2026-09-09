@@ -1,3 +1,5 @@
+// Public logging facade for console logger settings and styling.
+import type { ConsoleLoggerSettings, ConsoleStyle } from "./logging/console.js";
 import {
   enableConsoleCapture,
   getConsoleSettings,
@@ -7,9 +9,9 @@ import {
   setConsoleTimestampPrefix,
   shouldLogSubsystemToConsole,
 } from "./logging/console.js";
-import type { ConsoleLoggerSettings, ConsoleStyle } from "./logging/console.js";
-import { ALLOWED_LOG_LEVELS, levelToMinLevel, normalizeLogLevel } from "./logging/levels.js";
 import type { LogLevel } from "./logging/levels.js";
+import { ALLOWED_LOG_LEVELS, levelToMinLevel, normalizeLogLevel } from "./logging/levels.js";
+import type { LoggerResolvedSettings, LoggerSettings, PinoLikeLogger } from "./logging/logger.js";
 import {
   DEFAULT_LOG_DIR,
   DEFAULT_LOG_FILE,
@@ -18,17 +20,17 @@ import {
   getResolvedLoggerSettings,
   isFileLogLevelEnabled,
   resetLogger,
+  setLoggerConfigLoaderForTests,
   setLoggerOverride,
   toPinoLikeLogger,
 } from "./logging/logger.js";
-import type { LoggerResolvedSettings, LoggerSettings, PinoLikeLogger } from "./logging/logger.js";
+import type { SubsystemLogger } from "./logging/subsystem.js";
 import {
   createSubsystemLogger,
   createSubsystemRuntime,
   runtimeForLogger,
   stripRedundantSubsystemPrefixForConsole,
 } from "./logging/subsystem.js";
-import type { SubsystemLogger } from "./logging/subsystem.js";
 
 export {
   enableConsoleCapture,
@@ -48,6 +50,7 @@ export {
   getResolvedLoggerSettings,
   isFileLogLevelEnabled,
   resetLogger,
+  setLoggerConfigLoaderForTests,
   setLoggerOverride,
   toPinoLikeLogger,
   createSubsystemLogger,

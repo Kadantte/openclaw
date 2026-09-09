@@ -1,68 +1,117 @@
+import { asDateTimestampMs } from "@openclaw/normalization-core/number-coercion";
+// Handles auth directives that choose provider auth profiles for a reply.
+import { normalizeLowercaseStringOrEmpty } from "@openclaw/normalization-core/string-coerce";
+import { formatRemainingShort } from "../../agents/auth-health.js";
 import {
+  isConfiguredAwsSdkAuthProfileForProvider,
   isProfileInCooldown,
   resolveAuthProfileDisplayLabel,
   resolveAuthStorePathForDisplay,
 } from "../../agents/auth-profiles.js";
+import type { AuthProfileCredential } from "../../agents/auth-profiles/types.js";
 import {
   ensureAuthProfileStore,
-  getCustomProviderApiKey,
   resolveAuthProfileOrder,
   resolveEnvApiKey,
+  resolveUsableCustomProviderApiKey,
 } from "../../agents/model-auth.js";
-import { normalizeProviderId } from "../../agents/model-selection.js";
-import type { OpenClawConfig } from "../../config/config.js";
+import { findNormalizedProviderValue, normalizeProviderId } from "../../agents/model-selection.js";
+import type { OpenClawConfig } from "../../config/types.openclaw.js";
+import { coerceSecretRef } from "../../config/types.secrets.js";
+import { maskApiKey } from "../../security/secret-mask.js";
 import { shortenHomePath } from "../../utils.js";
 
+/** Controls how much auth provenance is shown in directive status output. */
 export type ModelAuthDetailMode = "compact" | "verbose";
 
-const maskApiKey = (value: string): string => {
-  const trimmed = value.trim();
-  if (!trimmed) return "missing";
-  if (trimmed.length <= 16) return trimmed;
-  return `${trimmed.slice(0, 8)}...${trimmed.slice(-8)}`;
-};
+function resolveStoredCredentialLabel(params: {
+  value: unknown;
+  refValue: unknown;
+  mode: ModelAuthDetailMode;
+}): string {
+  const masked = maskApiKey(typeof params.value === "string" ? params.value : "");
+  if (masked !== "missing") {
+    return masked;
+  }
+  if (coerceSecretRef(params.refValue)) {
+    return params.mode === "compact" ? "(ref)" : "ref";
+  }
+  return "missing";
+}
 
+function formatExpirationLabel(
+  expires: unknown,
+  now: number,
+  formatUntil: (timestampMs: number) => string,
+  compactExpiredPrefix = " expired",
+) {
+  const timestampMs = asDateTimestampMs(expires);
+  if (timestampMs === undefined || timestampMs <= 0) {
+    return "";
+  }
+  return timestampMs <= now ? compactExpiredPrefix : ` exp ${formatUntil(timestampMs)}`;
+}
+
+function formatFlagsSuffix(flags: string[]) {
+  return flags.length > 0 ? ` (${flags.join(", ")})` : "";
+}
+
+function isStoredAuthProfileType(value: unknown): value is AuthProfileCredential["type"] {
+  return value === "api_key" || value === "oauth" || value === "token";
+}
+
+/** Resolves the displayed auth source for a provider without exposing secrets. */
 export const resolveAuthLabel = async (
   provider: string,
   cfg: OpenClawConfig,
   modelsPath: string,
   agentDir?: string,
   mode: ModelAuthDetailMode = "compact",
+  workspaceDir?: string,
+  options?: { acceptedProfileTypes?: readonly AuthProfileCredential["type"][] },
 ): Promise<{ label: string; source: string }> => {
   const formatPath = (value: string) => shortenHomePath(value);
   const store = ensureAuthProfileStore(agentDir, {
     allowKeychainPrompt: false,
   });
-  const order = resolveAuthProfileOrder({ cfg, store, provider });
+  const rawOrder = resolveAuthProfileOrder({ cfg, store, provider });
+  const acceptedProfileTypes = options?.acceptedProfileTypes
+    ? new Set(options.acceptedProfileTypes)
+    : undefined;
+  const order = acceptedProfileTypes
+    ? rawOrder.filter((profileId) => {
+        const profile = store.profiles[profileId];
+        if (profile) {
+          return acceptedProfileTypes.has(profile.type);
+        }
+        const configuredMode = cfg.auth?.profiles?.[profileId]?.mode;
+        return isStoredAuthProfileType(configuredMode)
+          ? acceptedProfileTypes.has(configuredMode)
+          : true;
+      })
+    : rawOrder;
   const providerKey = normalizeProviderId(provider);
-  const lastGood = (() => {
-    const map = store.lastGood;
-    if (!map) return undefined;
-    for (const [key, value] of Object.entries(map)) {
-      if (normalizeProviderId(key) === providerKey) return value;
-    }
-    return undefined;
-  })();
+  const lastGood = findNormalizedProviderValue(store.lastGood, providerKey);
   const nextProfileId = order[0];
   const now = Date.now();
-
-  const formatUntil = (timestampMs: number) => {
-    const remainingMs = Math.max(0, timestampMs - now);
-    const minutes = Math.round(remainingMs / 60_000);
-    if (minutes < 1) return "soon";
-    if (minutes < 60) return `${minutes}m`;
-    const hours = Math.round(minutes / 60);
-    if (hours < 48) return `${hours}h`;
-    const days = Math.round(hours / 24);
-    return `${days}d`;
-  };
+  const formatUntil = (timestampMs: number) =>
+    formatRemainingShort(timestampMs - now, { underMinuteLabel: "soon" });
 
   if (order.length > 0) {
     if (mode === "compact") {
       const profileId = nextProfileId;
-      if (!profileId) return { label: "missing", source: "missing" };
+      if (!profileId) {
+        return { label: "missing", source: "missing" };
+      }
       const profile = store.profiles[profileId];
       const configProfile = cfg.auth?.profiles?.[profileId];
+      const configOnlyAwsSdk = !profile
+        ? isConfiguredAwsSdkAuthProfileForProvider({ cfg, provider, profileId })
+        : false;
+      const more = order.length > 1 ? ` (+${order.length - 1})` : "";
+      if (configOnlyAwsSdk) {
+        return { label: `${profileId} aws-sdk${more}`, source: "" };
+      }
       const missing =
         !profile ||
         (configProfile?.provider && configProfile.provider !== profile.provider) ||
@@ -70,39 +119,36 @@ export const resolveAuthLabel = async (
           configProfile.mode !== profile.type &&
           !(configProfile.mode === "oauth" && profile.type === "token"));
 
-      const more = order.length > 1 ? ` (+${order.length - 1})` : "";
-      if (missing) return { label: `${profileId} missing${more}`, source: "" };
+      if (missing) {
+        return { label: `${profileId} missing${more}`, source: "" };
+      }
 
       if (profile.type === "api_key") {
+        const keyLabel = resolveStoredCredentialLabel({
+          value: profile.key,
+          refValue: profile.keyRef,
+          mode,
+        });
         return {
-          label: `${profileId} api-key ${maskApiKey(profile.key)}${more}`,
+          label: `${profileId} api-key ${keyLabel}${more}`,
           source: "",
         };
       }
       if (profile.type === "token") {
-        const exp =
-          typeof profile.expires === "number" &&
-          Number.isFinite(profile.expires) &&
-          profile.expires > 0
-            ? profile.expires <= now
-              ? " expired"
-              : ` exp ${formatUntil(profile.expires)}`
-            : "";
+        const tokenLabel = resolveStoredCredentialLabel({
+          value: profile.token,
+          refValue: profile.tokenRef,
+          mode,
+        });
+        const exp = formatExpirationLabel(profile.expires, now, formatUntil);
         return {
-          label: `${profileId} token ${maskApiKey(profile.token)}${exp}${more}`,
+          label: `${profileId} token ${tokenLabel}${exp}${more}`,
           source: "",
         };
       }
       const display = resolveAuthProfileDisplayLabel({ cfg, store, profileId });
       const label = display === profileId ? profileId : display;
-      const exp =
-        typeof profile.expires === "number" &&
-        Number.isFinite(profile.expires) &&
-        profile.expires > 0
-          ? profile.expires <= now
-            ? " expired"
-            : ` exp ${formatUntil(profile.expires)}`
-          : "";
+      const exp = formatExpirationLabel(profile.expires, now, formatUntil);
       return { label: `${label} oauth${exp}${more}`, source: "" };
     }
 
@@ -110,8 +156,12 @@ export const resolveAuthLabel = async (
       const profile = store.profiles[profileId];
       const configProfile = cfg.auth?.profiles?.[profileId];
       const flags: string[] = [];
-      if (profileId === nextProfileId) flags.push("next");
-      if (lastGood && profileId === lastGood) flags.push("lastGood");
+      if (profileId === nextProfileId) {
+        flags.push("next");
+      }
+      if (lastGood && profileId === lastGood) {
+        flags.push("lastGood");
+      }
       if (isProfileInCooldown(store, profileId)) {
         const until = store.usageStats?.[profileId]?.cooldownUntil;
         if (typeof until === "number" && Number.isFinite(until) && until > now) {
@@ -120,6 +170,10 @@ export const resolveAuthLabel = async (
           flags.push("cooldown");
         }
       }
+      if (!profile && isConfiguredAwsSdkAuthProfileForProvider({ cfg, provider, profileId })) {
+        const suffix = formatFlagsSuffix(flags);
+        return `${profileId}=aws-sdk${suffix}`;
+      }
       if (
         !profile ||
         (configProfile?.provider && configProfile.provider !== profile.provider) ||
@@ -127,23 +181,30 @@ export const resolveAuthLabel = async (
           configProfile.mode !== profile.type &&
           !(configProfile.mode === "oauth" && profile.type === "token"))
       ) {
-        const suffix = flags.length > 0 ? ` (${flags.join(", ")})` : "";
+        const suffix = formatFlagsSuffix(flags);
         return `${profileId}=missing${suffix}`;
       }
       if (profile.type === "api_key") {
-        const suffix = flags.length > 0 ? ` (${flags.join(", ")})` : "";
-        return `${profileId}=${maskApiKey(profile.key)}${suffix}`;
+        const keyLabel = resolveStoredCredentialLabel({
+          value: profile.key,
+          refValue: profile.keyRef,
+          mode,
+        });
+        const suffix = formatFlagsSuffix(flags);
+        return `${profileId}=${keyLabel}${suffix}`;
       }
       if (profile.type === "token") {
-        if (
-          typeof profile.expires === "number" &&
-          Number.isFinite(profile.expires) &&
-          profile.expires > 0
-        ) {
-          flags.push(profile.expires <= now ? "expired" : `exp ${formatUntil(profile.expires)}`);
+        const tokenLabel = resolveStoredCredentialLabel({
+          value: profile.token,
+          refValue: profile.tokenRef,
+          mode,
+        });
+        const expirationFlag = formatExpirationLabel(profile.expires, now, formatUntil, "expired");
+        if (expirationFlag) {
+          flags.push(expirationFlag);
         }
-        const suffix = flags.length > 0 ? ` (${flags.join(", ")})` : "";
-        return `${profileId}=token:${maskApiKey(profile.token)}${suffix}`;
+        const suffix = formatFlagsSuffix(flags);
+        return `${profileId}=token:${tokenLabel}${suffix}`;
       }
       const display = resolveAuthProfileDisplayLabel({
         cfg,
@@ -156,32 +217,30 @@ export const resolveAuthLabel = async (
           : display.startsWith(profileId)
             ? display.slice(profileId.length).trim()
             : `(${display})`;
-      if (
-        typeof profile.expires === "number" &&
-        Number.isFinite(profile.expires) &&
-        profile.expires > 0
-      ) {
-        flags.push(profile.expires <= now ? "expired" : `exp ${formatUntil(profile.expires)}`);
+      const expirationFlag = formatExpirationLabel(profile.expires, now, formatUntil, "expired");
+      if (expirationFlag) {
+        flags.push(expirationFlag);
       }
       const suffixLabel = suffix ? ` ${suffix}` : "";
-      const suffixFlags = flags.length > 0 ? ` (${flags.join(", ")})` : "";
+      const suffixFlags = formatFlagsSuffix(flags);
       return `${profileId}=OAuth${suffixLabel}${suffixFlags}`;
     });
     return {
       label: labels.join(", "),
-      source: `auth-profiles.json: ${formatPath(resolveAuthStorePathForDisplay(agentDir))}`,
+      source: `auth profile store: ${formatPath(resolveAuthStorePathForDisplay(agentDir))}`,
     };
   }
 
-  const envKey = resolveEnvApiKey(provider);
+  // Auth profiles win over environment/config keys because they encode provider order.
+  const envKey = resolveEnvApiKey(provider, process.env, { config: cfg, workspaceDir });
   if (envKey) {
     const isOAuthEnv =
       envKey.source.includes("ANTHROPIC_OAUTH_TOKEN") ||
-      envKey.source.toLowerCase().includes("oauth");
+      normalizeLowercaseStringOrEmpty(envKey.source).includes("oauth");
     const label = isOAuthEnv ? "OAuth (env)" : maskApiKey(envKey.apiKey);
     return { label, source: mode === "verbose" ? envKey.source : "" };
   }
-  const customKey = getCustomProviderApiKey(cfg, provider);
+  const customKey = resolveUsableCustomProviderApiKey({ cfg, provider })?.apiKey;
   if (customKey) {
     return {
       label: maskApiKey(customKey),
@@ -191,32 +250,10 @@ export const resolveAuthLabel = async (
   return { label: "missing", source: "missing" };
 };
 
+/** Formats an auth label plus source for one-line status output. */
 export const formatAuthLabel = (auth: { label: string; source: string }) => {
   if (!auth.source || auth.source === auth.label || auth.source === "missing") {
     return auth.label;
   }
   return `${auth.label} (${auth.source})`;
-};
-
-export const resolveProfileOverride = (params: {
-  rawProfile?: string;
-  provider: string;
-  cfg: OpenClawConfig;
-  agentDir?: string;
-}): { profileId?: string; error?: string } => {
-  const raw = params.rawProfile?.trim();
-  if (!raw) return {};
-  const store = ensureAuthProfileStore(params.agentDir, {
-    allowKeychainPrompt: false,
-  });
-  const profile = store.profiles[raw];
-  if (!profile) {
-    return { error: `Auth profile "${raw}" not found.` };
-  }
-  if (profile.provider !== params.provider) {
-    return {
-      error: `Auth profile "${raw}" is for ${profile.provider}, not ${params.provider}.`,
-    };
-  }
-  return { profileId: raw };
 };

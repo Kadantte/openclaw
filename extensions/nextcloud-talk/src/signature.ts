@@ -1,5 +1,7 @@
+// Nextcloud Talk plugin module implements signature behavior.
 import { createHmac, randomBytes } from "node:crypto";
-
+import { safeEqualSecret } from "openclaw/plugin-sdk/security-runtime";
+import { normalizeLowercaseStringOrEmpty } from "openclaw/plugin-sdk/string-coerce-runtime";
 import type { NextcloudTalkWebhookHeaders } from "./types.js";
 
 const SIGNATURE_HEADER = "x-nextcloud-talk-signature";
@@ -17,18 +19,15 @@ export function verifyNextcloudTalkSignature(params: {
   secret: string;
 }): boolean {
   const { signature, random, body, secret } = params;
-  if (!signature || !random || !secret) return false;
+  if (!signature || !random || !secret) {
+    return false;
+  }
 
   const expected = createHmac("sha256", secret)
     .update(random + body)
     .digest("hex");
 
-  if (signature.length !== expected.length) return false;
-  let result = 0;
-  for (let i = 0; i < signature.length; i++) {
-    result |= signature.charCodeAt(i) ^ expected.charCodeAt(i);
-  }
-  return result === 0;
+  return safeEqualSecret(signature, expected);
 }
 
 /**
@@ -38,7 +37,7 @@ export function extractNextcloudTalkHeaders(
   headers: Record<string, string | string[] | undefined>,
 ): NextcloudTalkWebhookHeaders | null {
   const getHeader = (name: string): string | undefined => {
-    const value = headers[name] ?? headers[name.toLowerCase()];
+    const value = headers[name] ?? headers[normalizeLowercaseStringOrEmpty(name)];
     return Array.isArray(value) ? value[0] : value;
   };
 
@@ -46,7 +45,9 @@ export function extractNextcloudTalkHeaders(
   const random = getHeader(RANDOM_HEADER);
   const backend = getHeader(BACKEND_HEADER);
 
-  if (!signature || !random || !backend) return null;
+  if (!signature || !random || !backend) {
+    return null;
+  }
 
   return { signature, random, backend };
 }

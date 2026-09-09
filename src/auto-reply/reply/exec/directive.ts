@@ -1,9 +1,22 @@
-import type { ExecAsk, ExecHost, ExecSecurity } from "../../../infra/exec-approvals.js";
+// Parses execution directives for approval, sandbox, and target settings.
+import { normalizeOptionalLowercaseString } from "@openclaw/normalization-core/string-coerce";
+import {
+  type ExecAsk,
+  type ExecSecurity,
+  type ExecTarget,
+  normalizeExecTarget,
+} from "../../../infra/exec-approvals.js";
+import {
+  removeDirectiveSpan,
+  skipDirectiveArgPrefix,
+  takeDirectiveToken,
+} from "../directive-parsing.js";
 
+/** Parsed `/exec` directive state used to override execution policy for one turn. */
 type ExecDirectiveParse = {
   cleaned: string;
   hasDirective: boolean;
-  execHost?: ExecHost;
+  execHost?: ExecTarget;
   execSecurity?: ExecSecurity;
   execAsk?: ExecAsk;
   execNode?: string;
@@ -18,22 +31,16 @@ type ExecDirectiveParse = {
   invalidNode: boolean;
 };
 
-function normalizeExecHost(value?: string): ExecHost | undefined {
-  const normalized = value?.trim().toLowerCase();
-  if (normalized === "sandbox" || normalized === "gateway" || normalized === "node")
-    return normalized;
-  return undefined;
-}
-
 function normalizeExecSecurity(value?: string): ExecSecurity | undefined {
-  const normalized = value?.trim().toLowerCase();
-  if (normalized === "deny" || normalized === "allowlist" || normalized === "full")
+  const normalized = normalizeOptionalLowercaseString(value);
+  if (normalized === "deny" || normalized === "allowlist" || normalized === "full") {
     return normalized;
+  }
   return undefined;
 }
 
 function normalizeExecAsk(value?: string): ExecAsk | undefined {
-  const normalized = value?.trim().toLowerCase();
+  const normalized = normalizeOptionalLowercaseString(value);
   if (normalized === "off" || normalized === "on-miss" || normalized === "always") {
     return normalized as ExecAsk;
   }
@@ -46,15 +53,10 @@ function parseExecDirectiveArgs(raw: string): Omit<
 > & {
   consumed: number;
 } {
-  let i = 0;
   const len = raw.length;
-  while (i < len && /\s/.test(raw[i])) i += 1;
-  if (raw[i] === ":") {
-    i += 1;
-    while (i < len && /\s/.test(raw[i])) i += 1;
-  }
+  let i = skipDirectiveArgPrefix(raw);
   let consumed = i;
-  let execHost: ExecHost | undefined;
+  let execHost: ExecTarget | undefined;
   let execSecurity: ExecSecurity | undefined;
   let execAsk: ExecAsk | undefined;
   let execNode: string | undefined;
@@ -69,36 +71,45 @@ function parseExecDirectiveArgs(raw: string): Omit<
   let invalidNode = false;
 
   const takeToken = (): string | null => {
-    if (i >= len) return null;
-    const start = i;
-    while (i < len && !/\s/.test(raw[i])) i += 1;
-    if (start === i) return null;
-    const token = raw.slice(start, i);
-    while (i < len && /\s/.test(raw[i])) i += 1;
-    return token;
+    const res = takeDirectiveToken(raw, i);
+    i = res.nextIndex;
+    return res.token;
   };
 
   const splitToken = (token: string): { key: string; value: string } | null => {
     const eq = token.indexOf("=");
     const colon = token.indexOf(":");
     const idx = eq === -1 ? colon : colon === -1 ? eq : Math.min(eq, colon);
-    if (idx === -1) return null;
-    const key = token.slice(0, idx).trim().toLowerCase();
+    if (idx === -1) {
+      return null;
+    }
+    const key = normalizeOptionalLowercaseString(token.slice(0, idx));
     const value = token.slice(idx + 1).trim();
-    if (!key) return null;
+    if (!key) {
+      return null;
+    }
     return { key, value };
   };
 
-  while (i < len) {
+  for (;;) {
+    if (i >= len) {
+      break;
+    }
     const token = takeToken();
-    if (!token) break;
+    if (!token) {
+      break;
+    }
     const parsed = splitToken(token);
-    if (!parsed) break;
+    if (!parsed) {
+      break;
+    }
     const { key, value } = parsed;
     if (key === "host") {
       rawExecHost = value;
-      execHost = normalizeExecHost(value);
-      if (!execHost) invalidHost = true;
+      execHost = normalizeExecTarget(value) ?? undefined;
+      if (!execHost) {
+        invalidHost = true;
+      }
       hasExecOptions = true;
       consumed = i;
       continue;
@@ -106,7 +117,9 @@ function parseExecDirectiveArgs(raw: string): Omit<
     if (key === "security") {
       rawExecSecurity = value;
       execSecurity = normalizeExecSecurity(value);
-      if (!execSecurity) invalidSecurity = true;
+      if (!execSecurity) {
+        invalidSecurity = true;
+      }
       hasExecOptions = true;
       consumed = i;
       continue;
@@ -114,7 +127,9 @@ function parseExecDirectiveArgs(raw: string): Omit<
     if (key === "ask") {
       rawExecAsk = value;
       execAsk = normalizeExecAsk(value);
-      if (!execAsk) invalidAsk = true;
+      if (!execAsk) {
+        invalidAsk = true;
+      }
       hasExecOptions = true;
       consumed = i;
       continue;
@@ -152,6 +167,7 @@ function parseExecDirectiveArgs(raw: string): Omit<
   };
 }
 
+/** Extracts and removes `/exec` options from message text. */
 export function extractExecDirective(body?: string): ExecDirectiveParse {
   if (!body) {
     return {
@@ -164,11 +180,11 @@ export function extractExecDirective(body?: string): ExecDirectiveParse {
       invalidNode: false,
     };
   }
-  const re = /(?:^|\s)\/exec(?=$|\s|:)/i;
+  const re = /(?<!\S)\/exec(?=$|\s|:)/i;
   const match = re.exec(body);
   if (!match) {
     return {
-      cleaned: body.trim(),
+      cleaned: body,
       hasDirective: false,
       hasExecOptions: false,
       invalidHost: false,
@@ -177,11 +193,11 @@ export function extractExecDirective(body?: string): ExecDirectiveParse {
       invalidNode: false,
     };
   }
-  const start = match.index + match[0].indexOf("/exec");
+  const start = match.index;
   const argsStart = start + "/exec".length;
   const parsed = parseExecDirectiveArgs(body.slice(argsStart));
-  const cleanedRaw = `${body.slice(0, start)} ${body.slice(argsStart + parsed.consumed)}`;
-  const cleaned = cleanedRaw.replace(/\s+/g, " ").trim();
+  // Remove only consumed key/value options so remaining text still reaches the agent.
+  const cleaned = removeDirectiveSpan(body, start, argsStart + parsed.consumed);
   return {
     cleaned,
     hasDirective: true,

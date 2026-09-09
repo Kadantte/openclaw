@@ -3,13 +3,12 @@
  */
 
 import path from "node:path";
-
 import {
   detectMime,
   extensionForMime,
   extractOriginalFilename,
   getFileExtension,
-} from "openclaw/plugin-sdk";
+} from "../runtime-api.js";
 
 /**
  * Detect MIME type from URL extension or data URL.
@@ -19,7 +18,9 @@ export async function getMimeType(url: string): Promise<string> {
   // Handle data URLs: data:image/png;base64,...
   if (url.startsWith("data:")) {
     const match = url.match(/^data:([^;,]+)/);
-    if (match?.[1]) return match[1];
+    if (match?.[1]) {
+      return match[1];
+    }
   }
 
   // Use shared MIME detection (extension-based for URLs)
@@ -44,9 +45,27 @@ export async function extractFilename(url: string): Promise<string> {
   // Try to extract from URL pathname
   try {
     const pathname = new URL(url).pathname;
-    const basename = path.basename(pathname);
-    const existingExt = getFileExtension(pathname);
-    if (basename && existingExt) return basename;
+    let basename = path.basename(pathname);
+    if (basename.includes("%")) {
+      try {
+        const decodedBasename = decodeURIComponent(basename);
+        // Attachment names are display values; never turn escaped delimiters
+        // into a different filesystem or URL path.
+        if (
+          !decodedBasename.includes("/") &&
+          !decodedBasename.includes("\\") &&
+          !decodedBasename.includes("\0")
+        ) {
+          basename = decodedBasename;
+        }
+      } catch {
+        // Keep malformed percent escapes as the original literal filename.
+      }
+    }
+    const existingExt = getFileExtension(basename);
+    if (basename && existingExt) {
+      return basename;
+    }
     // No extension in URL, derive from MIME
     const mime = await getMimeType(url);
     const ext = extensionForMime(mime) ?? ".bin";
@@ -62,16 +81,41 @@ export async function extractFilename(url: string): Promise<string> {
  * Check if a URL refers to a local file path.
  */
 export function isLocalPath(url: string): boolean {
-  return url.startsWith("file://") || url.startsWith("/") || url.startsWith("~");
+  if (/^file:\/\//iu.test(url) || url.startsWith("/") || url.startsWith("~")) {
+    return true;
+  }
+
+  // Windows rooted path on current drive (e.g. \tmp\file.txt)
+  if (url.startsWith("\\") && !url.startsWith("\\\\")) {
+    return true;
+  }
+
+  // Windows drive-letter absolute path (e.g. C:\foo\bar.txt or C:/foo/bar.txt)
+  if (/^[a-zA-Z]:[\\/]/.test(url)) {
+    return true;
+  }
+
+  // Windows UNC path (e.g. \\server\share\file.txt)
+  if (url.startsWith("\\\\")) {
+    return true;
+  }
+
+  return false;
 }
 
 /**
  * Extract the message ID from a Bot Framework response.
  */
 export function extractMessageId(response: unknown): string | null {
-  if (!response || typeof response !== "object") return null;
-  if (!("id" in response)) return null;
+  if (!response || typeof response !== "object") {
+    return null;
+  }
+  if (!("id" in response)) {
+    return null;
+  }
   const { id } = response as { id?: unknown };
-  if (typeof id !== "string" || !id) return null;
+  if (typeof id !== "string" || !id) {
+    return null;
+  }
   return id;
 }

@@ -1,5 +1,10 @@
 {
   "id": "twitch",
+  "name": "Twitch",
+  "description": "OpenClaw Twitch channel plugin for chat and moderation workflows.",
+  "activation": {
+    "onStartup": false
+  },
   "channels": ["twitch"],
   "configSchema": {
     "type": "object",

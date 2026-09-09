@@ -1,87 +1,57 @@
-import fs from "node:fs/promises";
-import path from "node:path";
+// Cron protocol conformance tests cover schema compatibility for cron messages.
+import { Value } from "typebox/value";
 import { describe, expect, it } from "vitest";
-import { MACOS_APP_SOURCES_DIR } from "../compat/legacy-names.js";
-import { CronPayloadSchema } from "../gateway/protocol/schema.js";
+import { FAILOVER_REASONS } from "../../packages/gateway-protocol/src/failover-reasons.js";
+import {
+  CronDeliverySchema,
+  CronJobStateSchema,
+  CronRunLogEntrySchema,
+} from "../../packages/gateway-protocol/src/schema.js";
+import type { CronJob } from "../../packages/gateway-protocol/src/schema/cron.types.js";
 
-type SchemaLike = {
-  anyOf?: Array<{ properties?: Record<string, unknown> }>;
-  properties?: Record<string, unknown>;
-  const?: unknown;
-};
+type CronDelivery = NonNullable<CronJob["delivery"]>;
 
-type ProviderSchema = {
-  anyOf?: Array<{ const?: unknown }>;
-};
-
-function extractCronChannels(schema: SchemaLike): string[] {
-  const union = schema.anyOf ?? [];
-  const payloadWithChannel = union.find((entry) =>
-    Boolean(entry?.properties && "channel" in entry.properties),
-  );
-  const channelSchema = payloadWithChannel?.properties
-    ? (payloadWithChannel.properties.channel as ProviderSchema)
-    : undefined;
-  const channels = (channelSchema?.anyOf ?? [])
-    .map((entry) => entry?.const)
-    .filter((value): value is string => typeof value === "string");
-  return channels;
-}
-
-const UI_FILES = ["ui/src/ui/types.ts", "ui/src/ui/ui-types.ts", "ui/src/ui/views/cron.ts"];
-
-const SWIFT_FILE_CANDIDATES = [`${MACOS_APP_SOURCES_DIR}/GatewayConnection.swift`];
-
-async function resolveSwiftFiles(cwd: string): Promise<string[]> {
-  const matches: string[] = [];
-  for (const relPath of SWIFT_FILE_CANDIDATES) {
-    try {
-      await fs.access(path.join(cwd, relPath));
-      matches.push(relPath);
-    } catch {
-      // ignore missing path
-    }
-  }
-  if (matches.length === 0) {
-    throw new Error(`Missing Swift cron definition. Tried: ${SWIFT_FILE_CANDIDATES.join(", ")}`);
-  }
-  return matches;
-}
+const DELIVERY_FIXTURES = {
+  none: { mode: "none", threadId: 42 },
+  announce: {
+    mode: "announce",
+    channel: "telegram",
+    threadId: "topic-42",
+    completionDestination: { mode: "webhook", to: "https://example.test/complete" },
+    failureDestination: { mode: "announce", channel: "last", to: "ops" },
+  },
+  webhook: { mode: "webhook", to: "https://example.test/result" },
+} satisfies Record<CronDelivery["mode"], CronDelivery>;
 
 describe("cron protocol conformance", () => {
-  it("ui + swift include all cron providers from gateway schema", async () => {
-    const channels = extractCronChannels(CronPayloadSchema as SchemaLike);
-    expect(channels.length).toBeGreaterThan(0);
-
-    const cwd = process.cwd();
-    for (const relPath of UI_FILES) {
-      const content = await fs.readFile(path.join(cwd, relPath), "utf-8");
-      for (const channel of channels) {
-        expect(content.includes(`"${channel}"`), `${relPath} missing ${channel}`).toBe(true);
-      }
+  it("accepts every typed delivery mode and rejects unknown modes", () => {
+    for (const delivery of Object.values(DELIVERY_FIXTURES)) {
+      expect(Value.Check(CronDeliverySchema, delivery)).toBe(true);
     }
-
-    const swiftFiles = await resolveSwiftFiles(cwd);
-    for (const relPath of swiftFiles) {
-      const content = await fs.readFile(path.join(cwd, relPath), "utf-8");
-      for (const channel of channels) {
-        const pattern = new RegExp(`\\bcase\\s+${channel}\\b`);
-        expect(pattern.test(content), `${relPath} missing case ${channel}`).toBe(true);
-      }
-    }
+    expect(Value.Check(CronDeliverySchema, { mode: "email" })).toBe(false);
   });
 
-  it("cron status shape matches gateway fields in UI + Swift", async () => {
-    const cwd = process.cwd();
-    const uiTypes = await fs.readFile(path.join(cwd, "ui/src/ui/types.ts"), "utf-8");
-    expect(uiTypes.includes("export type CronStatus")).toBe(true);
-    expect(uiTypes.includes("jobs:")).toBe(true);
-    expect(uiTypes.includes("jobCount")).toBe(false);
+  it("accepts every core failover reason in state and run-history schemas", () => {
+    for (const reason of FAILOVER_REASONS) {
+      expect(Value.Check(CronJobStateSchema, { lastErrorReason: reason })).toBe(true);
+      expect(
+        Value.Check(CronRunLogEntrySchema, {
+          ts: 1,
+          jobId: "job-1",
+          action: "finished",
+          errorReason: reason,
+        }),
+      ).toBe(true);
+    }
 
-    const [swiftRelPath] = await resolveSwiftFiles(cwd);
-    const swiftPath = path.join(cwd, swiftRelPath);
-    const swift = await fs.readFile(swiftPath, "utf-8");
-    expect(swift.includes("struct CronSchedulerStatus")).toBe(true);
-    expect(swift.includes("let jobs:")).toBe(true);
+    expect(Value.Check(CronJobStateSchema, { lastErrorReason: "not-a-reason" })).toBe(false);
+    expect(
+      Value.Check(CronRunLogEntrySchema, {
+        ts: 1,
+        jobId: "job-1",
+        action: "finished",
+        errorReason: "not-a-reason",
+      }),
+    ).toBe(false);
   });
 });

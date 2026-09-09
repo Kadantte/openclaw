@@ -1,58 +1,59 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+/** Tests compact tool metadata formatting for auto-reply progress output. */
+import path from "node:path";
+import { describe, expect, it } from "vitest";
+import { withEnv } from "../test-utils/env.js";
+import { formatToolAggregate } from "./tool-meta.js";
 
-import { formatToolAggregate, formatToolPrefix, shortenMeta, shortenPath } from "./tool-meta.js";
+// Use path.resolve so inputs match the resolved HOME on every platform.
+const home = path.resolve("/Users/test");
+
+function withHome<T>(run: () => T): T {
+  return withEnv({ HOME: home }, run);
+}
 
 describe("tool meta formatting", () => {
-  beforeEach(() => {
-    vi.unstubAllEnvs();
-  });
-
-  it("shortens paths under HOME", () => {
-    vi.stubEnv("HOME", "/Users/test");
-    expect(shortenPath("/Users/test")).toBe("~");
-    expect(shortenPath("/Users/test/a/b.txt")).toBe("~/a/b.txt");
-    expect(shortenPath("/opt/x")).toBe("/opt/x");
-  });
-
-  it("shortens meta strings with optional colon suffix", () => {
-    vi.stubEnv("HOME", "/Users/test");
-    expect(shortenMeta("/Users/test/a.txt")).toBe("~/a.txt");
-    expect(shortenMeta("/Users/test/a.txt:12")).toBe("~/a.txt:12");
-    expect(shortenMeta("cd /Users/test/dir && ls")).toBe("cd ~/dir && ls");
-    expect(shortenMeta("")).toBe("");
+  it("shortens home paths with optional colon suffix", () => {
+    withHome(() => {
+      expect(formatToolAggregate("fs", [`${home}/a.txt`])).toContain("~/a.txt");
+      expect(formatToolAggregate("fs", [`${home}/a.txt:12`])).toContain("~/a.txt:12");
+      expect(formatToolAggregate("exec", [`cd ${home}/dir && ls`])).toContain("cd ~/dir && ls");
+      expect(formatToolAggregate("fs", [""])).toBe("🧩 Fs");
+    });
   });
 
   it("formats aggregates with grouping and brace-collapse", () => {
-    vi.stubEnv("HOME", "/Users/test");
-    const out = formatToolAggregate("  fs  ", [
-      "/Users/test/dir/a.txt",
-      "/Users/test/dir/b.txt",
-      "note",
-      "a→b",
-    ]);
-    expect(out).toMatch(/^🧩 Fs/);
-    expect(out).toContain("~/dir/{a.txt, b.txt}");
-    expect(out).toContain("note");
-    expect(out).toContain("a→b");
+    withHome(() => {
+      const out = formatToolAggregate("  fs  ", [
+        `${home}/dir/a.txt`,
+        `${home}/dir/b.txt`,
+        "note",
+        "a→b",
+      ]);
+      expect(out).toMatch(/^🧩 Fs/);
+      expect(out).toContain("~/dir/{a.txt, b.txt}");
+      expect(out).toContain("note");
+      expect(out).toContain("a→b");
+    });
   });
 
   it("wraps aggregate meta in backticks when markdown is enabled", () => {
-    vi.stubEnv("HOME", "/Users/test");
-    const out = formatToolAggregate("fs", ["/Users/test/dir/a.txt"], { markdown: true });
-    expect(out).toContain("`~/dir/a.txt`");
+    withHome(() => {
+      const out = formatToolAggregate("fs", [`${home}/dir/a.txt`], { markdown: true });
+      expect(out).toContain("`~/dir/a.txt`");
+    });
+  });
+
+  it("uses a longer inline code delimiter when meta contains backticks", () => {
+    const out = formatToolAggregate("fs", ["name `with` ticks"], { markdown: true });
+    expect(out).toBe("🧩 Fs: ``name `with` ticks``");
   });
 
   it("keeps exec flags outside markdown and moves them to the front", () => {
-    vi.stubEnv("HOME", "/Users/test");
-    const out = formatToolAggregate("exec", ["cd /Users/test/dir && gemini 2>&1 · elevated"], {
-      markdown: true,
+    withHome(() => {
+      const out = formatToolAggregate("exec", [`cd ${home}/dir && gemini 2>&1 · elevated`], {
+        markdown: true,
+      });
+      expect(out).toBe("🛠️ elevated · `cd ~/dir && gemini 2>&1`");
     });
-    expect(out).toBe("🛠️ Exec: elevated · `cd ~/dir && gemini 2>&1`");
-  });
-
-  it("formats prefixes with default labels", () => {
-    vi.stubEnv("HOME", "/Users/test");
-    expect(formatToolPrefix(undefined, undefined)).toBe("🧩 Tool");
-    expect(formatToolPrefix("x", "/Users/test/a.txt")).toBe("🧩 X: ~/a.txt");
   });
 });

@@ -1,58 +1,83 @@
-import type { AllowlistMatch } from "openclaw/plugin-sdk";
+// Matrix plugin module implements allowlist behavior.
+import {
+  resolveAllowlistMatchByCandidates,
+  type AllowlistMatch,
+} from "openclaw/plugin-sdk/allow-from";
+import { normalizeLowercaseStringOrEmpty } from "openclaw/plugin-sdk/string-coerce-runtime";
+import { normalizeStringEntries } from "openclaw/plugin-sdk/string-normalization-runtime";
 
 function normalizeAllowList(list?: Array<string | number>) {
-  return (list ?? []).map((entry) => String(entry).trim()).filter(Boolean);
-}
-
-export function normalizeAllowListLower(list?: Array<string | number>) {
-  return normalizeAllowList(list).map((entry) => entry.toLowerCase());
+  return normalizeStringEntries(list);
 }
 
 function normalizeMatrixUser(raw?: string | null): string {
-  return (raw ?? "").trim().toLowerCase();
+  const value = (raw ?? "").trim();
+  if (!value) {
+    return "";
+  }
+  if (!value.startsWith("@") || !value.includes(":")) {
+    return normalizeLowercaseStringOrEmpty(value);
+  }
+  return value;
 }
 
-export type MatrixAllowListMatch = AllowlistMatch<
-  "wildcard" | "id" | "prefixed-id" | "prefixed-user" | "name" | "localpart"
->;
+export function normalizeMatrixUserId(raw?: string | null): string {
+  const trimmed = (raw ?? "").trim();
+  if (!trimmed) {
+    return "";
+  }
+  const lowered = normalizeLowercaseStringOrEmpty(trimmed);
+  if (lowered.startsWith("matrix:")) {
+    return normalizeMatrixUser(trimmed.slice("matrix:".length));
+  }
+  if (lowered.startsWith("user:")) {
+    return normalizeMatrixUser(trimmed.slice("user:".length));
+  }
+  return normalizeMatrixUser(trimmed);
+}
+
+function normalizeMatrixAllowListEntry(raw: string): string {
+  const trimmed = raw.trim();
+  if (!trimmed) {
+    return "";
+  }
+  if (trimmed === "*") {
+    return trimmed;
+  }
+  const lowered = normalizeLowercaseStringOrEmpty(trimmed);
+  if (lowered.startsWith("matrix:")) {
+    return `matrix:${normalizeMatrixUser(trimmed.slice("matrix:".length))}`;
+  }
+  if (lowered.startsWith("user:")) {
+    return `user:${normalizeMatrixUser(trimmed.slice("user:".length))}`;
+  }
+  return normalizeMatrixUser(trimmed);
+}
+
+export function normalizeMatrixAllowList(list?: Array<string | number>) {
+  return normalizeAllowList(list).map((entry) => normalizeMatrixAllowListEntry(entry));
+}
+
+type MatrixAllowListMatch = AllowlistMatch<"wildcard" | "id" | "prefixed-id" | "prefixed-user">;
+
+type MatrixAllowListMatchSource = NonNullable<MatrixAllowListMatch["matchSource"]>;
 
 export function resolveMatrixAllowListMatch(params: {
   allowList: string[];
   userId?: string;
-  userName?: string;
 }): MatrixAllowListMatch {
   const allowList = params.allowList;
-  if (allowList.length === 0) return { allowed: false };
+  if (allowList.length === 0) {
+    return { allowed: false };
+  }
   if (allowList.includes("*")) {
     return { allowed: true, matchKey: "*", matchSource: "wildcard" };
   }
   const userId = normalizeMatrixUser(params.userId);
-  const userName = normalizeMatrixUser(params.userName);
-  const localPart = userId.startsWith("@") ? (userId.slice(1).split(":")[0] ?? "") : "";
-  const candidates: Array<{ value?: string; source: MatrixAllowListMatch["matchSource"] }> = [
+  const candidates: Array<{ value?: string; source: MatrixAllowListMatchSource }> = [
     { value: userId, source: "id" },
     { value: userId ? `matrix:${userId}` : "", source: "prefixed-id" },
     { value: userId ? `user:${userId}` : "", source: "prefixed-user" },
-    { value: userName, source: "name" },
-    { value: localPart, source: "localpart" },
   ];
-  for (const candidate of candidates) {
-    if (!candidate.value) continue;
-    if (allowList.includes(candidate.value)) {
-      return {
-        allowed: true,
-        matchKey: candidate.value,
-        matchSource: candidate.source,
-      };
-    }
-  }
-  return { allowed: false };
-}
-
-export function resolveMatrixAllowListMatches(params: {
-  allowList: string[];
-  userId?: string;
-  userName?: string;
-}) {
-  return resolveMatrixAllowListMatch(params).allowed;
+  return resolveAllowlistMatchByCandidates<MatrixAllowListMatchSource>({ allowList, candidates });
 }

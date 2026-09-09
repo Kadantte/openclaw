@@ -1,152 +1,345 @@
 ---
-summary: "Session management rules, keys, and persistence for chats"
+summary: "How OpenClaw manages conversation sessions"
 read_when:
-  - Modifying session handling or storage
+  - You want to understand session routing and isolation
+  - You want to configure DM scope for multi-user setups
+  - You are debugging daily or idle session resets
+title: "Session management"
 ---
-# Session Management
 
-OpenClaw treats **one direct-chat session per agent** as primary. Direct chats collapse to `agent:<agentId>:<mainKey>` (default `main`), while group/channel chats get their own keys. `session.mainKey` is honored.
+OpenClaw routes every inbound message to a **session** based on where it came
+from: DMs, group chats, cron jobs, etc. All session state is owned by the
+**gateway**; UI clients query the gateway for session data.
 
-Use `session.dmScope` to control how **direct messages** are grouped:
-- `main` (default): all DMs share the main session for continuity.
-- `per-peer`: isolate by sender id across channels.
-- `per-channel-peer`: isolate by channel + sender (recommended for multi-user inboxes).
-- `per-account-channel-peer`: isolate by account + channel + sender (recommended for multi-account inboxes).
-Use `session.identityLinks` to map provider-prefixed peer ids to a canonical identity so the same person shares a DM session across channels when using `per-peer`, `per-channel-peer`, or `per-account-channel-peer`.
+To continue the same Gateway-owned session in the Control UI, terminal, or a
+coding harness, see [Session synchronization and attachment](/concepts/session-attachment).
 
-## Gateway is the source of truth
-All session state is **owned by the gateway** (the “master” OpenClaw). UI clients (macOS app, WebChat, etc.) must query the gateway for session lists and token counts instead of reading local files.
+For the personal-agent default — one rolling conversation shared by all your
+DM channels, with group activity and background work flowing into it — see
+[The main session](/concepts/main-session).
 
-- In **remote mode**, the session store you care about lives on the remote gateway host, not your Mac.
-- Token counts shown in UIs come from the gateway’s store fields (`inputTokens`, `outputTokens`, `totalTokens`, `contextTokens`). Clients do not parse JSONL transcripts to “fix up” totals.
+## How messages are routed
 
-## Where state lives
-- On the **gateway host**:
-  - Store file: `~/.openclaw/agents/<agentId>/sessions/sessions.json` (per agent).
-- Transcripts: `~/.openclaw/agents/<agentId>/sessions/<SessionId>.jsonl` (Telegram topic sessions use `.../<SessionId>-topic-<threadId>.jsonl`).
-- The store is a map `sessionKey -> { sessionId, updatedAt, ... }`. Deleting entries is safe; they are recreated on demand.
-- Group entries may include `displayName`, `channel`, `subject`, `room`, and `space` to label sessions in UIs.
-- Session entries include `origin` metadata (label + routing hints) so UIs can explain where a session came from.
-- OpenClaw does **not** read legacy Pi/Tau session folders.
+| Source          | Behavior                      |
+| --------------- | ----------------------------- |
+| Direct messages | Shared session by default     |
+| Group chats     | Isolated per group by default |
+| Rooms/channels  | Isolated per room by default  |
+| Cron jobs       | Fresh session per run         |
+| Webhooks        | Isolated per hook             |
 
-## Session pruning
-OpenClaw trims **old tool results** from the in-memory context right before LLM calls by default.
-This does **not** rewrite JSONL history. See [/concepts/session-pruning](/concepts/session-pruning).
+With `session.scope: "global"`, the selected agent still owns its session.
+The shared key `global` does not merge different agents' conversations:
+commands, skills, replies, and background task notifications retain the
+agent selected by the route or explicit request.
+Session lists, model filters, previews, and sharing controls also retain the
+stored conversation's agent, rather than the aggregate view's default agent.
 
-## Pre-compaction memory flush
-When a session nears auto-compaction, OpenClaw can run a **silent memory flush**
-turn that reminds the model to write durable notes to disk. This only runs when
-the workspace is writable. See [Memory](/concepts/memory) and
-[Compaction](/concepts/compaction).
+## DM isolation
 
-## Mapping transports → session keys
-- Direct chats follow `session.dmScope` (default `main`).
-  - `main`: `agent:<agentId>:<mainKey>` (continuity across devices/channels).
-    - Multiple phone numbers and channels can map to the same agent main key; they act as transports into one conversation.
-  - `per-peer`: `agent:<agentId>:dm:<peerId>`.
-  - `per-channel-peer`: `agent:<agentId>:<channel>:dm:<peerId>`.
-  - `per-account-channel-peer`: `agent:<agentId>:<channel>:<accountId>:dm:<peerId>` (accountId defaults to `default`).
-  - If `session.identityLinks` matches a provider-prefixed peer id (for example `telegram:123`), the canonical key replaces `<peerId>` so the same person shares a session across channels.
-- Group chats isolate state: `agent:<agentId>:<channel>:group:<id>` (rooms/channels use `agent:<agentId>:<channel>:channel:<id>`).
-  - Telegram forum topics append `:topic:<threadId>` to the group id for isolation.
-  - Legacy `group:<id>` keys are still recognized for migration.
-- Inbound contexts may still use `group:<id>`; the channel is inferred from `Provider` and normalized to the canonical `agent:<agentId>:<channel>:group:<id>` form.
-- Other sources:
-  - Cron jobs: `cron:<job.id>`
-  - Webhooks: `hook:<uuid>` (unless explicitly set by the hook)
-  - Node runs: `node-<nodeId>`
+By default, all DMs share one session for continuity, which is fine for
+single-user setups.
 
-## Lifecycle
-- Reset policy: sessions are reused until they expire, and expiry is evaluated on the next inbound message.
-- Daily reset: defaults to **4:00 AM local time on the gateway host**. A session is stale once its last update is earlier than the most recent daily reset time.
-- Idle reset (optional): `idleMinutes` adds a sliding idle window. When both daily and idle resets are configured, **whichever expires first** forces a new session.
-- Legacy idle-only: if you set `session.idleMinutes` without any `session.reset`/`resetByType` config, OpenClaw stays in idle-only mode for backward compatibility.
-- Per-type overrides (optional): `resetByType` lets you override the policy for `dm`, `group`, and `thread` sessions (thread = Slack/Discord threads, Telegram topics, Matrix threads when provided by the connector).
-- Per-channel overrides (optional): `resetByChannel` overrides the reset policy for a channel (applies to all session types for that channel and takes precedence over `reset`/`resetByType`).
-- Reset triggers: exact `/new` or `/reset` (plus any extras in `resetTriggers`) start a fresh session id and pass the remainder of the message through. `/new <model>` accepts a model alias, `provider/model`, or provider name (fuzzy match) to set the new session model. If `/new` or `/reset` is sent alone, OpenClaw runs a short “hello” greeting turn to confirm the reset.
-- Manual reset: delete specific keys from the store or remove the JSONL transcript; the next message recreates them.
-- Isolated cron jobs always mint a fresh `sessionId` per run (no idle reuse).
-
-## Send policy (optional)
-Block delivery for specific session types without listing individual ids.
+<Warning>
+If multiple people can message your agent, enable DM isolation. Without it, all
+users share the same conversation context, so Alice's private messages would be
+visible to Bob.
+</Warning>
 
 ```json5
 {
   session: {
-    sendPolicy: {
-      rules: [
-        { action: "deny", match: { channel: "discord", chatType: "group" } },
-        { action: "deny", match: { keyPrefix: "cron:" } }
-      ],
-      default: "allow"
-    }
-  }
+    dmScope: "per-channel-peer", // isolate by channel + sender
+  },
 }
 ```
 
-Runtime override (owner only):
-- `/send on` → allow for this session
-- `/send off` → deny for this session
-- `/send inherit` → clear override and use config rules
-Send these as standalone messages so they register.
+`session.dmScope` options:
 
-## Configuration (optional rename example)
+| Value                      | Behavior                                                 |
+| -------------------------- | -------------------------------------------------------- |
+| `main` (default)           | All DMs share the [main session](/concepts/main-session) |
+| `per-peer`                 | Isolate by sender, across channels                       |
+| `per-channel-peer`         | Isolate by channel + sender (recommended)                |
+| `per-account-channel-peer` | Isolate by account + channel + sender                    |
+
+Slack Agent View and Assistant View DMs are the exception: each visible root gets
+its own `:thread:<rootTs>` session on top of the base that `dmScope` selects, so
+those conversations stay isolated even under `main`. See
+[Agent View DMs](/channels/slack/threads-and-sessions#agent-view-dms).
+
+<Tip>
+If the same person contacts you from multiple channels, use
+`session.identityLinks` to map their identities to one canonical peer id so
+they share a session.
+</Tip>
+
+Verify your setup with `openclaw security audit`.
+
+## Retired channel docking
+
+Channel docking and manual cross-channel reply focus have been removed. The
+`/dock-*` commands no longer move a session's reply destination to another
+channel.
+
+Use `session.identityLinks` to associate a person's identities for DM session
+routing, or [thread-bound sessions](/tools/subagents#thread-bound-sessions) to
+keep a supported conversation attached to a subagent. These are separate
+features; neither restores manual cross-channel docking.
+
+## Group and room routing
+
+`session.groupScope` controls where non-direct peers store conversation
+context:
+
+| Value                 | Behavior                                                                                  |
+| --------------------- | ----------------------------------------------------------------------------------------- |
+| `per-group` (default) | Keep each group, room, or channel in its existing channel-scoped session                  |
+| `main`                | Route groups, rooms, and channels into the agent's [main session](/concepts/main-session) |
+
+A route binding can override the global value. This is useful when only a
+named team room should join the main conversation:
+
 ```json5
-// ~/.openclaw/openclaw.json
+{
+  bindings: [
+    {
+      agentId: "main",
+      match: {
+        channel: "slack",
+        peer: { kind: "channel", id: "C0123TEAM" },
+      },
+      session: { groupScope: "main" },
+    },
+  ],
+}
+```
+
+Use `peer.kind: "group"` for providers that classify the room as a group.
+The binding override wins over global `session.groupScope`. This setting
+changes session-key selection only: DM routing, mention gating, delivery
+context, and replies to the source room remain unchanged.
+
+## Incognito sessions
+
+Incognito sessions are available only from the Control UI's **New thread** screen. Turn on **Incognito** before starting the thread to keep its session entry, transcript, and compaction state in process memory instead of on disk. The thread disappears when the Gateway restarts, does not run OpenClaw's automatic memory flush, and does not create a transcript archive when you reset or delete it. Codex-backed runs also start their harness thread in ephemeral mode, so Codex writes no rollout or local session-state files; other model providers use HTTP APIs and keep no local provider transcript in OpenClaw.
+
+The `incognito-` segment is reserved for dashboard, subagent, and hidden internal session keys; `openclaw doctor --fix` renames any colliding legacy durable keys.
+
+Incognito does not restrict the agent's normal tools. An explicit request to save information, or any tool-driven file write, can still persist data outside the incognito session store. Your configured model provider still processes the messages you send, diagnostic logging remains unchanged, and OpenClaw still records content-free audit metadata such as HMAC references.
+
+On multi-user gateways, incognito threads are visible only to admin-scope connections and never appear through another session's agent session tools or transcript search. This protects them from storage and other gateway-mediated users, not from the gateway owner or process operator, who can always observe live sessions.
+
+## Remember across conversations
+
+Separate transcripts control each conversation's local history. For a personal
+or fully trusted agent, `memory.search.rememberAcrossConversations: true`
+adds an optional retrieval step across that agent's other private
+conversations; it does not combine their transcripts.
+
+Private direct and persistent explicit UI conversations can supply relevant
+context to one another. Under default `session.groupScope: "per-group"`, groups and channels stay separate in both directions:
+their transcripts are not private recall sources, and replies in those
+conversations do not receive private transcript context. The current
+conversation is also excluded because its history is already loaded.
+
+This setting does not change session keys, DM scope, routing, delivery, or
+`tools.sessions.visibility`. Shared workspace memory in `MEMORY.md` and
+`memory/*.md` also keeps its existing behavior. The current memory provider
+must support protected private transcript recall; context engines such as
+Lossless Claw remain independent and can run alongside it. See
+[Active Memory](/concepts/active-memory#remember-across-conversations) for setup
+and runtime details.
+
+## Session lifecycle
+
+Sessions are reused until you reset them manually or opt into an automatic reset policy:
+
+- **No automatic reset** (default `mode: "none"`) - sessions keep the same
+  `sessionId`; compaction manages the active context as the conversation grows.
+- **Daily reset** (`mode: "daily"`) - opt into a new session at a configured local
+  hour (`session.reset.atHour`, default `4`, 0-23) on the gateway host. Daily
+  freshness is based on when the current `sessionId` started, not on later
+  metadata writes.
+- **Idle reset** (`mode: "idle"`) - opt into a new session after `session.reset.idleMinutes`
+  of inactivity. Idle freshness is based on the last real user/channel
+  interaction, so heartbeat, cron, and exec system events do not keep the
+  session alive.
+- **Manual reset** - type `/new` or `/reset` in chat. `/new <model>` also
+  switches the model.
+
+When both daily and idle resets are configured, whichever expires first wins.
+Heartbeat, cron, exec, and other system-event turns may write session metadata,
+but those writes do not extend daily or idle reset freshness. When a reset
+rolls the session, queued system-event notices for the old session are
+discarded so stale background updates are not prepended to the first prompt in
+the new session.
+
+Sessions with an active provider-owned CLI session follow the same no-automatic-reset
+default. Use `/reset` or configure `session.reset` explicitly when those sessions
+should expire on a timer.
+
+Opt into automatic resets globally, then override them per chat type or channel:
+
+```json5
 {
   session: {
-    scope: "per-sender",      // keep group keys separate
-    dmScope: "main",          // DM continuity (set per-channel-peer/per-account-channel-peer for shared inboxes)
-    identityLinks: {
-      alice: ["telegram:123456789", "discord:987654321012345678"]
-    },
-    reset: {
-      // Defaults: mode=daily, atHour=4 (gateway host local time).
-      // If you also set idleMinutes, whichever expires first wins.
-      mode: "daily",
-      atHour: 4,
-      idleMinutes: 120
-    },
+    reset: { mode: "daily", atHour: 4 },
     resetByType: {
-      thread: { mode: "daily", atHour: 4 },
-      dm: { mode: "idle", idleMinutes: 240 },
-      group: { mode: "idle", idleMinutes: 120 }
+      group: { mode: "idle", idleMinutes: 120 },
+      thread: { mode: "daily", atHour: 6 },
     },
     resetByChannel: {
-      discord: { mode: "idle", idleMinutes: 10080 }
+      discord: { mode: "idle", idleMinutes: 10080 },
     },
-    resetTriggers: ["/new", "/reset"],
-    store: "~/.openclaw/agents/{agentId}/sessions/sessions.json",
-    mainKey: "main",
-  }
+  },
 }
 ```
 
-## Inspecting
-- `openclaw status` — shows store path and recent sessions.
-- `openclaw sessions --json` — dumps every entry (filter with `--active <minutes>`).
-- `openclaw gateway call sessions.list --params '{}'` — fetch sessions from the running gateway (use `--url`/`--token` for remote gateway access).
-- Send `/status` as a standalone message in chat to see whether the agent is reachable, how much of the session context is used, current thinking/verbose toggles, and when your WhatsApp web creds were last refreshed (helps spot relink needs).
-- Send `/context list` or `/context detail` to see what’s in the system prompt and injected workspace files (and the biggest context contributors).
-- Send `/stop` as a standalone message to abort the current run, clear queued followups for that session, and stop any sub-agent runs spawned from it (the reply includes the stopped count).
-- Send `/compact` (optional instructions) as a standalone message to summarize older context and free up window space. See [/concepts/compaction](/concepts/compaction).
-- JSONL transcripts can be opened directly to review full turns.
+`resetByType` supports `direct`, `group`, and `thread`. Doctor migrates legacy `dm` entries to `direct` and `session.idleMinutes` to `session.reset.idleMinutes`; the schema rejects both retired forms.
 
-## Tips
-- Keep the primary key dedicated to 1:1 traffic; let groups keep their own keys.
-- When automating cleanup, delete individual keys instead of the whole store to preserve context elsewhere.
+## Gateway restart recovery
 
-## Session origin metadata
-Each session entry records where it came from (best-effort) in `origin`:
-- `label`: human label (resolved from conversation label + group subject/channel)
-- `provider`: normalized channel id (including extensions)
-- `from`/`to`: raw routing ids from the inbound envelope
-- `accountId`: provider account id (when multi-account)
-- `threadId`: thread/topic id when the channel supports it
-The origin fields are populated for direct messages, channels, and groups. If a
-connector only updates delivery routing (for example, to keep a DM main session
-fresh), it should still provide inbound context so the session keeps its
-explainer metadata. Extensions can do this by sending `ConversationLabel`,
-`GroupSubject`, `GroupChannel`, `GroupSpace`, and `SenderName` in the inbound
-context and calling `recordSessionMetaFromInbound` (or passing the same context
-to `updateLastRoute`).
+When a Gateway restart interrupts an active turn, OpenClaw tries to continue
+the existing session automatically. Three attempts that fail to start a backend
+turn exhaust the recovery budget. Once a real backend turn starts,
+the budget refreshes, so a later Gateway restart does not consume the old allowance.
+Accepting, queueing, or preparing a resume request alone does not refresh it.
+CLI backends that do not report turn acceptance refresh the budget only after
+observed assistant output or tool activity; silent startup does not refresh it.
+
+If automatic recovery is exhausted, the transcript remains available. Use
+**Resume in new session** in WebChat, or `/new` or `/reset` in other channels,
+to start a replacement session.
+
+## Where state lives
+
+- **Runtime session rows and transcripts:** `~/.openclaw/agents/<agentId>/agent/openclaw-agent.sqlite` by default
+- **Archived transcript files:** `~/.openclaw/agents/<agentId>/sessions/`
+- **Legacy row migration source:** `~/.openclaw/agents/<agentId>/sessions/sessions.json`
+
+The session rows in the per-agent SQLite database keep separate lifecycle
+timestamps:
+
+- `sessionStartedAt`: when the current `sessionId` began; daily reset uses this.
+- `lastInteractionAt`: last user/channel interaction that extends idle lifetime.
+- `updatedAt`: last store-row mutation; useful for listing and pruning, but not
+  authoritative for daily/idle reset freshness.
+
+To import legacy `sessions.json` rows and hot transcript JSONL history from an
+older installation, stop the Gateway, back up its state, and run
+`openclaw doctor --fix` before restarting it. Gateway and local CLI startup use
+SQLite without importing, restoring, or rewriting legacy session files.
+If startup finds a legacy store, it refuses readiness and prints the Doctor
+command for the active profile instead of silently starting with empty history.
+During Doctor import, rows without `sessionStartedAt` are resolved from the
+legacy transcript JSONL session header when available. If an older row also
+lacks `lastInteractionAt`, idle freshness falls back to that session start time,
+not to later bookkeeping writes. Use `openclaw doctor --session-sqlite inspect
+--session-sqlite-all-agents` and the [Doctor migration
+sequence](/cli/doctor#session-sqlite-migration) for inspection and validation.
+
+## Session maintenance
+
+OpenClaw bounds session storage over time via `session.maintenance`, defaults
+shown:
+
+```json5
+{
+  session: {
+    maintenance: {
+      mode: "enforce", // "enforce" applies cleanup; "warn" only reports
+      pruneAfter: "30d",
+      archiveDashboardAfter: "7d", // false or 0 disables this dashboard trigger
+      maxEntries: 5000,
+      preserveRecent: false, // opt in with a duration such as "7d"
+    },
+  },
+}
+```
+
+For production-sized `maxEntries` limits, Gateway runtime writes use a small
+high-water buffer and clean back down to the configured cap in batches.
+Session store reads do not prune or cap entries during Gateway startup, so
+startup and isolated cron sessions do not pay for a full store cleanup.
+`openclaw sessions cleanup --enforce` applies the cap immediately.
+
+`maxEntries` defaults to 5000 unarchived session rows. Archived rows do not consume
+the cap. Existing explicit limits remain unchanged.
+When pressure exceeds the cap, cleanup archives the oldest eligible ordinary
+sessions instead of deleting their transcripts. Synthetic runtime sessions such
+as cron, hooks, heartbeat, ACP, and sub-agents remain disposable and may be
+removed. Pinned root sessions, active or admitted work, model-locked sessions, and
+durable external conversation pointers are protected; the unarchived total can
+therefore remain above the cap when protected rows alone exceed it.
+
+Only root sessions can be pinned; child/subagent sessions live in their parent's
+tree and reject pin requests. Existing child pins disappear and no longer protect
+the session from maintenance.
+
+Gateway model-run probe sessions are short-lived by default. Rows matching
+`agent:*:explicit:model-run-<uuid>` use fixed `24h` retention, but cleanup is
+pressure-gated: it only removes stale probe rows when session-entry
+maintenance/cap pressure is reached, and runs before the broader stale-entry
+age cutoff and entry cap. Normal direct, group, thread, cron, hook, heartbeat,
+ACP, and sub-agent sessions do not inherit this 24h retention.
+
+Maintenance preserves durable external conversation pointers, including direct,
+group, and thread-scoped chat sessions, while still allowing synthetic cron, hook,
+heartbeat, ACP, and sub-agent entries to age out.
+
+Shared or high-volume installations can set `preserveRecent` to protect
+recently active interactive sessions and every SQLite history generation owned
+by those sessions. The option is disabled when omitted or set to `false`, so
+personal installations keep the normal oldest-first policy. Synthetic
+model-run, cron, hook, heartbeat, ACP, and sub-agent sessions remain eligible
+for bounded cleanup. Protection can temporarily keep the store above its entry
+or disk target; it expires after the configured inactivity window.
+
+Recent-session protection does not change managed-worktree garbage collection;
+durable dashboard sessions auto-archive after 7 days of inactivity by default,
+and `pruneAfter` archives other eligible durable sessions in place after 30 days
+by default, preserving their session ids and transcript generations. Disposable
+automation rows still delete at their age cutoff.
+
+Pinned sessions and manual, legacy, age-retention, stale-dashboard, or recovery
+archives are user-protected and exempt from automatic maintenance. Sessions archived because
+`maxEntries` was reached record that reason and remain searchable/restorable
+until physical usage exceeds `maxDiskBytes`; disk-budget cleanup may then delete
+the oldest cap archives after cheaper artifacts and unreferenced history are
+exhausted. Sessions without a recorded archive reason remain protected.
+
+If you previously used DM isolation and later returned `session.dmScope` to
+`main`, preview stale peer-keyed DM rows with
+`openclaw sessions cleanup --dry-run --fix-dm-scope`. Applying the same flag
+retires those old direct-DM rows and keeps their transcripts as deleted
+archives.
+
+Preview any maintenance run with `openclaw sessions cleanup --dry-run`.
+
+## Inspecting sessions
+
+| Command                    | Shows                                           |
+| -------------------------- | ----------------------------------------------- |
+| `openclaw status`          | Session store path and recent activity          |
+| `openclaw sessions --json` | All sessions (filter with `--active <minutes>`) |
+| `/status` in chat          | Context usage, model, and toggles               |
+| `/context list`            | What is in the system prompt                    |
+
+## Further reading
+
+- [Session search](/concepts/session-search) - full-text recall across past transcripts
+- [Session Pruning](/concepts/session-pruning) - trimming tool results
+- [Compaction](/concepts/compaction) - summarizing long conversations
+- [Session Tools](/concepts/session-tool) - agent tools for cross-session work
+- [Session Management Deep Dive](/reference/session-management-compaction) -
+  store schema, transcripts, send policy, origin metadata, and advanced config
+- [Multi-Agent](/concepts/multi-agent) - routing and session isolation across agents
+- [Background Tasks](/automation/tasks) - how detached work creates task records with session references
+- [Channel Routing](/channels/channel-routing) - how inbound messages are routed to sessions
+
+## Related
+
+- [Session pruning](/concepts/session-pruning)
+- [Session tools](/concepts/session-tool)
+- [Command queue](/concepts/queue)

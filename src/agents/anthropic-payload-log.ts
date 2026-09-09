@@ -1,14 +1,19 @@
+/**
+ * Optional Anthropic request/usage JSONL diagnostics.
+ * Redacts payload content before writing and stores digests for correlation
+ * without persisting raw secret-bearing request bodies.
+ */
 import crypto from "node:crypto";
-import fs from "node:fs/promises";
 import path from "node:path";
-
-import type { AgentMessage, StreamFn } from "@mariozechner/pi-agent-core";
-import type { Api, Model } from "@mariozechner/pi-ai";
-
 import { resolveStateDir } from "../config/paths.js";
-import { parseBooleanValue } from "../utils/boolean.js";
-import { resolveUserPath } from "../utils.js";
+import type { Model } from "../llm/types.js";
 import { createSubsystemLogger } from "../logging/subsystem.js";
+import { resolveUserPath } from "../utils.js";
+import { parseBooleanValue } from "../utils/boolean.js";
+import { safeJsonStringify } from "../utils/safe-json.js";
+import { redactAgentDiagnosticPayload } from "./diagnostic-redaction.js";
+import { getQueuedFileWriter, type QueuedFileWriter } from "./queued-file-writer.js";
+import type { AgentMessage, StreamFn } from "./runtime/index.js";
 
 type PayloadLogStage = "request" | "usage";
 
@@ -23,7 +28,7 @@ type PayloadLogEvent = {
   modelApi?: string | null;
   workspaceDir?: string;
   payload?: unknown;
-  usage?: Record<string, unknown>;
+  usage?: unknown;
   error?: string;
   payloadDigest?: string;
 };
@@ -33,10 +38,7 @@ type PayloadLogConfig = {
   filePath: string;
 };
 
-type PayloadLogWriter = {
-  filePath: string;
-  write: (line: string) => void;
-};
+type PayloadLogWriter = QueuedFileWriter;
 
 const writers = new Map<string, PayloadLogWriter>();
 const log = createSubsystemLogger("agent/anthropic-payload");
@@ -51,68 +53,44 @@ function resolvePayloadLogConfig(env: NodeJS.ProcessEnv): PayloadLogConfig {
 }
 
 function getWriter(filePath: string): PayloadLogWriter {
-  const existing = writers.get(filePath);
-  if (existing) return existing;
-
-  const dir = path.dirname(filePath);
-  const ready = fs.mkdir(dir, { recursive: true }).catch(() => undefined);
-  let queue = Promise.resolve();
-
-  const writer: PayloadLogWriter = {
-    filePath,
-    write: (line: string) => {
-      queue = queue
-        .then(() => ready)
-        .then(() => fs.appendFile(filePath, line, "utf8"))
-        .catch(() => undefined);
-    },
-  };
-
-  writers.set(filePath, writer);
-  return writer;
-}
-
-function safeJsonStringify(value: unknown): string | null {
-  try {
-    return JSON.stringify(value, (_key, val) => {
-      if (typeof val === "bigint") return val.toString();
-      if (typeof val === "function") return "[Function]";
-      if (val instanceof Error) {
-        return { name: val.name, message: val.message, stack: val.stack };
-      }
-      if (val instanceof Uint8Array) {
-        return { type: "Uint8Array", data: Buffer.from(val).toString("base64") };
-      }
-      return val;
-    });
-  } catch {
-    return null;
-  }
+  return getQueuedFileWriter(writers, filePath);
 }
 
 function formatError(error: unknown): string | undefined {
-  if (error instanceof Error) return error.message;
-  if (typeof error === "string") return error;
+  if (error instanceof Error) {
+    const redacted = redactAgentDiagnosticPayload(error.message);
+    return typeof redacted === "string" ? redacted : error.message;
+  }
+  if (typeof error === "string") {
+    const redacted = redactAgentDiagnosticPayload(error);
+    return typeof redacted === "string" ? redacted : error;
+  }
   if (typeof error === "number" || typeof error === "boolean" || typeof error === "bigint") {
     return String(error);
   }
   if (error && typeof error === "object") {
-    return safeJsonStringify(error) ?? "unknown error";
+    return safeJsonStringify(redactAgentDiagnosticPayload(error)) ?? "unknown error";
   }
   return undefined;
 }
 
 function digest(value: unknown): string | undefined {
+  // Hash the redacted payload so repeated requests can be correlated even when
+  // payload bodies are too sensitive to inspect directly.
   const serialized = safeJsonStringify(value);
-  if (!serialized) return undefined;
+  if (!serialized) {
+    return undefined;
+  }
   return crypto.createHash("sha256").update(serialized).digest("hex");
 }
 
-function isAnthropicModel(model: Model<Api> | undefined | null): boolean {
+function isAnthropicModel(model: Model | undefined | null): boolean {
   return (model as { api?: unknown })?.api === "anthropic-messages";
 }
 
 function findLastAssistantUsage(messages: AgentMessage[]): Record<string, unknown> | null {
+  // Usage is attached to assistant messages after streaming; walk backwards to
+  // avoid logging stale usage from an earlier assistant turn.
   for (let i = messages.length - 1; i >= 0; i -= 1) {
     const msg = messages[i] as { role?: unknown; usage?: unknown };
     if (msg?.role === "assistant" && msg.usage && typeof msg.usage === "object") {
@@ -122,12 +100,13 @@ function findLastAssistantUsage(messages: AgentMessage[]): Record<string, unknow
   return null;
 }
 
-export type AnthropicPayloadLogger = {
+type AnthropicPayloadLogger = {
   enabled: true;
   wrapStreamFn: (streamFn: StreamFn) => StreamFn;
   recordUsage: (messages: AgentMessage[], error?: unknown) => void;
 };
 
+/** Create an Anthropic payload/usage logger when the env flag is enabled. */
 export function createAnthropicPayloadLogger(params: {
   env?: NodeJS.ProcessEnv;
   runId?: string;
@@ -137,12 +116,15 @@ export function createAnthropicPayloadLogger(params: {
   modelId?: string;
   modelApi?: string | null;
   workspaceDir?: string;
+  writer?: PayloadLogWriter;
 }): AnthropicPayloadLogger | null {
   const env = params.env ?? process.env;
   const cfg = resolvePayloadLogConfig(env);
-  if (!cfg.enabled) return null;
+  if (!cfg.enabled) {
+    return null;
+  }
 
-  const writer = getWriter(cfg.filePath);
+  const writer = params.writer ?? getWriter(cfg.filePath);
   const base: Omit<PayloadLogEvent, "ts" | "stage"> = {
     runId: params.runId,
     sessionId: params.sessionId,
@@ -155,24 +137,29 @@ export function createAnthropicPayloadLogger(params: {
 
   const record = (event: PayloadLogEvent) => {
     const line = safeJsonStringify(event);
-    if (!line) return;
+    if (!line) {
+      return;
+    }
     writer.write(`${line}\n`);
   };
 
   const wrapStreamFn: AnthropicPayloadLogger["wrapStreamFn"] = (streamFn) => {
     const wrapped: StreamFn = (model, context, options) => {
-      if (!isAnthropicModel(model as Model<Api>)) {
+      if (!isAnthropicModel(model)) {
         return streamFn(model, context, options);
       }
       const nextOnPayload = (payload: unknown) => {
+        // Forward the original payload to the provider hook, but persist only
+        // the redacted diagnostic copy.
+        const redactedPayload = redactAgentDiagnosticPayload(payload);
         record({
           ...base,
           ts: new Date().toISOString(),
           stage: "request",
-          payload,
-          payloadDigest: digest(payload),
+          payload: redactedPayload,
+          payloadDigest: digest(redactedPayload),
         });
-        options?.onPayload?.(payload);
+        return options?.onPayload?.(payload, model);
       };
       return streamFn(model, context, {
         ...options,
@@ -200,7 +187,7 @@ export function createAnthropicPayloadLogger(params: {
       ...base,
       ts: new Date().toISOString(),
       stage: "usage",
-      usage,
+      usage: redactAgentDiagnosticPayload(usage),
       error: errorMessage,
     });
     log.info("anthropic usage", {

@@ -1,65 +1,86 @@
-import type { OpenClawConfig } from "../config/config.js";
+// Resolves diagnostics feature flags from config and environment.
+import { normalizeLowercaseStringOrEmpty } from "@openclaw/normalization-core/string-coerce";
+import { normalizeUniqueStringEntriesLower } from "@openclaw/normalization-core/string-normalization";
+import type { OpenClawConfig } from "../config/types.openclaw.js";
 
 const DIAGNOSTICS_ENV = "OPENCLAW_DIAGNOSTICS";
 
-function normalizeFlag(value: string): string {
-  return value.trim().toLowerCase();
-}
+type ParsedEnvFlags = {
+  flags: string[];
+  disablesAll: boolean;
+};
 
-function parseEnvFlags(raw?: string): string[] {
-  if (!raw) return [];
-  const trimmed = raw.trim();
-  if (!trimmed) return [];
-  const lowered = trimmed.toLowerCase();
-  if (["0", "false", "off", "none"].includes(lowered)) return [];
-  if (["1", "true", "all", "*"].includes(lowered)) return ["*"];
-  return trimmed
-    .split(/[,\s]+/)
-    .map(normalizeFlag)
-    .filter(Boolean);
-}
-
-function uniqueFlags(flags: string[]): string[] {
-  const seen = new Set<string>();
-  const out: string[] = [];
-  for (const flag of flags) {
-    const normalized = normalizeFlag(flag);
-    if (!normalized || seen.has(normalized)) continue;
-    seen.add(normalized);
-    out.push(normalized);
+function parseEnvFlags(raw?: string): ParsedEnvFlags {
+  if (!raw) {
+    return { flags: [], disablesAll: false };
   }
-  return out;
+  const trimmed = raw.trim();
+  const lowered = normalizeLowercaseStringOrEmpty(trimmed);
+  if (!lowered) {
+    return { flags: [], disablesAll: false };
+  }
+  if (["0", "false", "off", "none"].includes(lowered)) {
+    return { flags: [], disablesAll: true };
+  }
+  if (["1", "true", "all", "*"].includes(lowered)) {
+    return { flags: ["*"], disablesAll: false };
+  }
+  return {
+    flags: trimmed
+      .split(/[,\s]+/)
+      .map((value) => normalizeLowercaseStringOrEmpty(value))
+      .filter(Boolean),
+    disablesAll: false,
+  };
 }
 
+/** Resolves enabled diagnostic flags from config plus `OPENCLAW_DIAGNOSTICS` overrides. */
 export function resolveDiagnosticFlags(
   cfg?: OpenClawConfig,
   env: NodeJS.ProcessEnv = process.env,
 ): string[] {
   const configFlags = Array.isArray(cfg?.diagnostics?.flags) ? cfg?.diagnostics?.flags : [];
   const envFlags = parseEnvFlags(env[DIAGNOSTICS_ENV]);
-  return uniqueFlags([...configFlags, ...envFlags]);
+  if (envFlags.disablesAll) {
+    return [];
+  }
+  return normalizeUniqueStringEntriesLower([...configFlags, ...envFlags.flags]);
 }
 
+/** Matches one diagnostic flag against exact, wildcard, and namespace-enabled flags. */
 export function matchesDiagnosticFlag(flag: string, enabledFlags: string[]): boolean {
-  const target = normalizeFlag(flag);
-  if (!target) return false;
+  const target = normalizeLowercaseStringOrEmpty(flag);
+  if (!target) {
+    return false;
+  }
   for (const raw of enabledFlags) {
-    const enabled = normalizeFlag(raw);
-    if (!enabled) continue;
-    if (enabled === "*" || enabled === "all") return true;
+    const enabled = normalizeLowercaseStringOrEmpty(raw);
+    if (!enabled) {
+      continue;
+    }
+    if (enabled === "*" || enabled === "all") {
+      return true;
+    }
     if (enabled.endsWith(".*")) {
       const prefix = enabled.slice(0, -2);
-      if (target === prefix || target.startsWith(`${prefix}.`)) return true;
+      if (target === prefix || target.startsWith(`${prefix}.`)) {
+        return true;
+      }
     }
     if (enabled.endsWith("*")) {
       const prefix = enabled.slice(0, -1);
-      if (target.startsWith(prefix)) return true;
+      if (target.startsWith(prefix)) {
+        return true;
+      }
     }
-    if (enabled === target) return true;
+    if (enabled === target) {
+      return true;
+    }
   }
   return false;
 }
 
+/** Returns whether a diagnostic flag is enabled after config/env resolution. */
 export function isDiagnosticFlagEnabled(
   flag: string,
   cfg?: OpenClawConfig,

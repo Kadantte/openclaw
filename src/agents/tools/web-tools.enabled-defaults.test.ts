@@ -1,11 +1,129 @@
+// Web tool default tests cover enablement, runtime provider discovery, and
+// late-bound runtime config for web_search/web_fetch tools.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-
+import { createEmptyPluginRegistry } from "../../plugins/registry-empty.js";
+import { setActivePluginRegistry } from "../../plugins/runtime.js";
+import {
+  clearActiveRuntimeWebToolsMetadata,
+  setActiveRuntimeWebToolsMetadata,
+} from "../../secrets/runtime-web-tools-state.js";
 import { createWebFetchTool, createWebSearchTool } from "./web-tools.js";
+
+const runWebSearchCalls = vi.hoisted(
+  () =>
+    [] as Array<{
+      config?: unknown;
+      preferRuntimeProviders?: boolean;
+      runtimeWebSearch?: unknown;
+    }>,
+);
+const activeSecretsRuntimeSnapshot = vi.hoisted(() => ({
+  current: null as null | { config: unknown },
+}));
+
+function readConfiguredSearchProvider(config: unknown): string | undefined {
+  if (!config || typeof config !== "object") {
+    return undefined;
+  }
+  const tools = (config as { tools?: unknown }).tools;
+  if (!tools || typeof tools !== "object") {
+    return undefined;
+  }
+  const web = (tools as { web?: unknown }).web;
+  if (!web || typeof web !== "object") {
+    return undefined;
+  }
+  const search = (web as { search?: unknown }).search;
+  if (!search || typeof search !== "object") {
+    return undefined;
+  }
+  const provider = (search as { provider?: unknown }).provider;
+  return typeof provider === "string" ? provider : undefined;
+}
+
+vi.mock("../../secrets/runtime-state.js", () => ({
+  getActiveSecretsRuntimeConfigSnapshot: () => activeSecretsRuntimeSnapshot.current,
+}));
+
+vi.mock("../../web-search/runtime.js", async () => {
+  const { getActivePluginRegistry } = await import("../../plugins/runtime.js");
+  const { getActiveRuntimeWebToolsMetadataFromState } =
+    await import("../../secrets/runtime-web-tools-state.js");
+  const resolveRuntimeDefinition = (options?: {
+    config?: unknown;
+    runtimeWebSearch?: { selectedProvider?: string; providerConfigured?: string };
+  }) => {
+    // The mock mirrors production provider resolution order closely enough to
+    // catch stale construction-time metadata in late-bound tool instances.
+    const providerId =
+      options?.runtimeWebSearch?.selectedProvider ??
+      options?.runtimeWebSearch?.providerConfigured ??
+      getActiveRuntimeWebToolsMetadataFromState()?.search?.selectedProvider ??
+      getActiveRuntimeWebToolsMetadataFromState()?.search?.providerConfigured ??
+      readConfiguredSearchProvider(options?.config);
+    const registration = getActivePluginRegistry()?.webSearchProviders.find(
+      (entry) => entry.provider.id === providerId,
+    );
+    const definition = registration?.provider.createTool({
+      config: options?.config as never,
+      runtimeMetadata: options?.runtimeWebSearch as never,
+    });
+    return registration && definition
+      ? {
+          provider: {
+            ...registration.provider,
+            pluginId: registration.pluginId,
+          },
+          definition,
+        }
+      : null;
+  };
+  return {
+    resolveWebSearchDefinition: resolveRuntimeDefinition,
+    resolveWebSearchProviderId: () => "",
+    runWebSearch: async (options: {
+      config?: unknown;
+      args: Record<string, unknown>;
+      preferRuntimeProviders?: boolean;
+      runtimeWebSearch?: unknown;
+    }) => {
+      runWebSearchCalls.push({
+        config: options.config,
+        preferRuntimeProviders: options.preferRuntimeProviders,
+        runtimeWebSearch: options.runtimeWebSearch,
+      });
+      const resolved = resolveRuntimeDefinition(options as never);
+      if (!resolved) {
+        throw new Error("web_search is disabled or no provider is available.");
+      }
+      return {
+        provider: resolved.provider.id,
+        result: await resolved.definition.execute(options.args),
+      };
+    },
+  };
+});
+
+beforeEach(() => {
+  setActivePluginRegistry(createEmptyPluginRegistry());
+  clearActiveRuntimeWebToolsMetadata();
+  activeSecretsRuntimeSnapshot.current = null;
+  runWebSearchCalls.length = 0;
+});
+
+afterEach(() => {
+  setActivePluginRegistry(createEmptyPluginRegistry());
+  clearActiveRuntimeWebToolsMetadata();
+  activeSecretsRuntimeSnapshot.current = null;
+});
 
 describe("web tools defaults", () => {
   it("enables web_fetch by default (non-sandbox)", () => {
-    const tool = createWebFetchTool({ config: {}, sandboxed: false });
-    expect(tool?.name).toBe("web_fetch");
+    const fetchTool = createWebFetchTool({ config: {}, sandboxed: false });
+    const searchTool = createWebSearchTool({ config: {}, sandboxed: false });
+    expect(fetchTool?.name).toBe("web_fetch");
+    expect(fetchTool?.resultContentSource).toBe("network");
+    expect(searchTool?.resultContentSource).toBe("network");
   });
 
   it("disables web_fetch when explicitly disabled", () => {
@@ -16,294 +134,194 @@ describe("web tools defaults", () => {
     expect(tool).toBeNull();
   });
 
-  it("enables web_search by default", () => {
-    const tool = createWebSearchTool({ config: {}, sandboxed: false });
-    expect(tool?.name).toBe("web_search");
-  });
-});
-
-describe("web_search country and language parameters", () => {
-  const priorFetch = global.fetch;
-
-  beforeEach(() => {
-    vi.stubEnv("BRAVE_API_KEY", "test-key");
-  });
-
-  afterEach(() => {
-    vi.unstubAllEnvs();
-    // @ts-expect-error global fetch cleanup
-    global.fetch = priorFetch;
-  });
-
-  it("should pass country parameter to Brave API", async () => {
-    const mockFetch = vi.fn(() =>
-      Promise.resolve({
-        ok: true,
-        json: () => Promise.resolve({ web: { results: [] } }),
-      } as Response),
-    );
-    // @ts-expect-error mock fetch
-    global.fetch = mockFetch;
-
-    const tool = createWebSearchTool({ config: undefined, sandboxed: true });
-    expect(tool).not.toBeNull();
-
-    await tool?.execute?.(1, { query: "test", country: "DE" });
-
-    expect(mockFetch).toHaveBeenCalled();
-    const url = new URL(mockFetch.mock.calls[0][0] as string);
-    expect(url.searchParams.get("country")).toBe("DE");
-  });
-
-  it("should pass search_lang parameter to Brave API", async () => {
-    const mockFetch = vi.fn(() =>
-      Promise.resolve({
-        ok: true,
-        json: () => Promise.resolve({ web: { results: [] } }),
-      } as Response),
-    );
-    // @ts-expect-error mock fetch
-    global.fetch = mockFetch;
-
-    const tool = createWebSearchTool({ config: undefined, sandboxed: true });
-    await tool?.execute?.(1, { query: "test", search_lang: "de" });
-
-    const url = new URL(mockFetch.mock.calls[0][0] as string);
-    expect(url.searchParams.get("search_lang")).toBe("de");
-  });
-
-  it("should pass ui_lang parameter to Brave API", async () => {
-    const mockFetch = vi.fn(() =>
-      Promise.resolve({
-        ok: true,
-        json: () => Promise.resolve({ web: { results: [] } }),
-      } as Response),
-    );
-    // @ts-expect-error mock fetch
-    global.fetch = mockFetch;
-
-    const tool = createWebSearchTool({ config: undefined, sandboxed: true });
-    await tool?.execute?.(1, { query: "test", ui_lang: "de" });
-
-    const url = new URL(mockFetch.mock.calls[0][0] as string);
-    expect(url.searchParams.get("ui_lang")).toBe("de");
-  });
-
-  it("should pass freshness parameter to Brave API", async () => {
-    const mockFetch = vi.fn(() =>
-      Promise.resolve({
-        ok: true,
-        json: () => Promise.resolve({ web: { results: [] } }),
-      } as Response),
-    );
-    // @ts-expect-error mock fetch
-    global.fetch = mockFetch;
-
-    const tool = createWebSearchTool({ config: undefined, sandboxed: true });
-    await tool?.execute?.(1, { query: "test", freshness: "pw" });
-
-    const url = new URL(mockFetch.mock.calls[0][0] as string);
-    expect(url.searchParams.get("freshness")).toBe("pw");
-  });
-
-  it("rejects invalid freshness values", async () => {
-    const mockFetch = vi.fn(() =>
-      Promise.resolve({
-        ok: true,
-        json: () => Promise.resolve({ web: { results: [] } }),
-      } as Response),
-    );
-    // @ts-expect-error mock fetch
-    global.fetch = mockFetch;
-
-    const tool = createWebSearchTool({ config: undefined, sandboxed: true });
-    const result = await tool?.execute?.(1, { query: "test", freshness: "yesterday" });
-
-    expect(mockFetch).not.toHaveBeenCalled();
-    expect(result?.details).toMatchObject({ error: "invalid_freshness" });
-  });
-});
-
-describe("web_search perplexity baseUrl defaults", () => {
-  const priorFetch = global.fetch;
-
-  afterEach(() => {
-    vi.unstubAllEnvs();
-    // @ts-expect-error global fetch cleanup
-    global.fetch = priorFetch;
-  });
-
-  it("defaults to Perplexity direct when PERPLEXITY_API_KEY is set", async () => {
-    vi.stubEnv("PERPLEXITY_API_KEY", "pplx-test");
-    const mockFetch = vi.fn(() =>
-      Promise.resolve({
-        ok: true,
-        json: () => Promise.resolve({ choices: [{ message: { content: "ok" } }], citations: [] }),
-      } as Response),
-    );
-    // @ts-expect-error mock fetch
-    global.fetch = mockFetch;
+  it("uses runtime-only web_search providers when runtime metadata is present", async () => {
+    const registry = createEmptyPluginRegistry();
+    registry.webSearchProviders.push({
+      pluginId: "custom-search",
+      pluginName: "Custom Search",
+      source: "test",
+      provider: {
+        id: "custom",
+        label: "Custom Search",
+        hint: "Custom runtime provider",
+        envVars: ["CUSTOM_SEARCH_API_KEY"],
+        placeholder: "custom-...",
+        signupUrl: "https://example.com/signup",
+        autoDetectOrder: 1,
+        credentialPath: "tools.web.search.custom.apiKey",
+        getCredentialValue: () => "configured",
+        setCredentialValue: () => {},
+        createTool: () => ({
+          description: "custom runtime tool",
+          parameters: {},
+          execute: async () => ({ query: "openclaw", results: [] }),
+        }),
+      },
+    });
+    setActivePluginRegistry(registry);
 
     const tool = createWebSearchTool({
-      config: { tools: { web: { search: { provider: "perplexity" } } } },
       sandboxed: true,
+      runtimeWebSearch: {
+        providerConfigured: "custom",
+        providerSource: "configured",
+        selectedProvider: "custom",
+        selectedProviderKeySource: "config",
+        diagnostics: [],
+      },
     });
-    await tool?.execute?.(1, { query: "test-openrouter" });
 
-    expect(mockFetch).toHaveBeenCalled();
-    expect(mockFetch.mock.calls[0]?.[0]).toBe("https://api.perplexity.ai/chat/completions");
+    const result = await tool?.execute?.("call-runtime-provider", { query: "openclaw" });
+
+    expect(tool?.description).toContain("Search current web");
+    expect(result?.details).toMatchObject({
+      kind: "results",
+      provider: "custom",
+      query: "openclaw",
+      count: 0,
+      results: [],
+    });
   });
 
-  it("rejects freshness for Perplexity provider", async () => {
-    vi.stubEnv("PERPLEXITY_API_KEY", "pplx-test");
-    const mockFetch = vi.fn(() =>
-      Promise.resolve({
-        ok: true,
-        json: () => Promise.resolve({ choices: [{ message: { content: "ok" } }], citations: [] }),
-      } as Response),
-    );
-    // @ts-expect-error mock fetch
-    global.fetch = mockFetch;
-
-    const tool = createWebSearchTool({
-      config: { tools: { web: { search: { provider: "perplexity" } } } },
-      sandboxed: true,
+  it("keeps runtime provider discovery enabled when runtime web_search metadata is missing", async () => {
+    const registry = createEmptyPluginRegistry();
+    registry.webSearchProviders.push({
+      pluginId: "custom-search",
+      pluginName: "Custom Search",
+      source: "test",
+      provider: {
+        id: "custom",
+        label: "Custom Search",
+        hint: "Custom runtime provider",
+        envVars: ["CUSTOM_SEARCH_API_KEY"],
+        placeholder: "custom-...",
+        signupUrl: "https://example.com/signup",
+        autoDetectOrder: 1,
+        credentialPath: "plugins.entries.custom-search.config.webSearch.apiKey",
+        getCredentialValue: () => "configured",
+        setCredentialValue: () => {},
+        createTool: () => ({
+          description: "custom runtime tool",
+          parameters: {},
+          execute: async () => ({ query: "openclaw", results: [] }),
+        }),
+      },
     });
-    const result = await tool?.execute?.(1, { query: "test", freshness: "pw" });
-
-    expect(mockFetch).not.toHaveBeenCalled();
-    expect(result?.details).toMatchObject({ error: "unsupported_freshness" });
-  });
-
-  it("defaults to OpenRouter when OPENROUTER_API_KEY is set", async () => {
-    vi.stubEnv("PERPLEXITY_API_KEY", "");
-    vi.stubEnv("OPENROUTER_API_KEY", "sk-or-test");
-    const mockFetch = vi.fn(() =>
-      Promise.resolve({
-        ok: true,
-        json: () => Promise.resolve({ choices: [{ message: { content: "ok" } }], citations: [] }),
-      } as Response),
-    );
-    // @ts-expect-error mock fetch
-    global.fetch = mockFetch;
-
-    const tool = createWebSearchTool({
-      config: { tools: { web: { search: { provider: "perplexity" } } } },
-      sandboxed: true,
-    });
-    await tool?.execute?.(1, { query: "test-openrouter-env" });
-
-    expect(mockFetch).toHaveBeenCalled();
-    expect(mockFetch.mock.calls[0]?.[0]).toBe("https://openrouter.ai/api/v1/chat/completions");
-  });
-
-  it("prefers PERPLEXITY_API_KEY when both env keys are set", async () => {
-    vi.stubEnv("PERPLEXITY_API_KEY", "pplx-test");
-    vi.stubEnv("OPENROUTER_API_KEY", "sk-or-test");
-    const mockFetch = vi.fn(() =>
-      Promise.resolve({
-        ok: true,
-        json: () => Promise.resolve({ choices: [{ message: { content: "ok" } }], citations: [] }),
-      } as Response),
-    );
-    // @ts-expect-error mock fetch
-    global.fetch = mockFetch;
-
-    const tool = createWebSearchTool({
-      config: { tools: { web: { search: { provider: "perplexity" } } } },
-      sandboxed: true,
-    });
-    await tool?.execute?.(1, { query: "test-both-env" });
-
-    expect(mockFetch).toHaveBeenCalled();
-    expect(mockFetch.mock.calls[0]?.[0]).toBe("https://api.perplexity.ai/chat/completions");
-  });
-
-  it("uses configured baseUrl even when PERPLEXITY_API_KEY is set", async () => {
-    vi.stubEnv("PERPLEXITY_API_KEY", "pplx-test");
-    const mockFetch = vi.fn(() =>
-      Promise.resolve({
-        ok: true,
-        json: () => Promise.resolve({ choices: [{ message: { content: "ok" } }], citations: [] }),
-      } as Response),
-    );
-    // @ts-expect-error mock fetch
-    global.fetch = mockFetch;
+    setActivePluginRegistry(registry);
 
     const tool = createWebSearchTool({
       config: {
         tools: {
           web: {
             search: {
-              provider: "perplexity",
-              perplexity: { baseUrl: "https://example.com/pplx" },
+              provider: "custom",
             },
           },
         },
       },
       sandboxed: true,
     });
-    await tool?.execute?.(1, { query: "test-config-baseurl" });
 
-    expect(mockFetch).toHaveBeenCalled();
-    expect(mockFetch.mock.calls[0]?.[0]).toBe("https://example.com/pplx/chat/completions");
+    const result = await tool?.execute?.("call-runtime-provider-without-metadata", {
+      query: "openclaw",
+    });
+
+    expect((result?.details as { provider?: string } | undefined)?.provider).toBe("custom");
+    expect(runWebSearchCalls).toHaveLength(1);
+    expect(runWebSearchCalls[0]?.preferRuntimeProviders).toBe(true);
   });
 
-  it("defaults to Perplexity direct when apiKey looks like Perplexity", async () => {
-    const mockFetch = vi.fn(() =>
-      Promise.resolve({
-        ok: true,
-        json: () => Promise.resolve({ choices: [{ message: { content: "ok" } }], citations: [] }),
-      } as Response),
-    );
-    // @ts-expect-error mock fetch
-    global.fetch = mockFetch;
-
-    const tool = createWebSearchTool({
-      config: {
-        tools: {
-          web: {
-            search: {
-              provider: "perplexity",
-              perplexity: { apiKey: "pplx-config" },
-            },
-          },
+  it("late-binds managed web_search execution to the current runtime snapshot", async () => {
+    // Managed agents can outlive a credentials refresh; execution should read
+    // the active runtime snapshot just before dispatch.
+    const registry = createEmptyPluginRegistry();
+    registry.webSearchProviders.push(
+      {
+        pluginId: "stale-search",
+        pluginName: "Stale Search",
+        source: "test",
+        provider: {
+          id: "stale",
+          label: "Stale Search",
+          hint: "Stale runtime provider",
+          envVars: [],
+          placeholder: "stale-...",
+          signupUrl: "https://example.com/stale",
+          autoDetectOrder: 1,
+          credentialPath: "tools.web.search.stale.apiKey",
+          getCredentialValue: () => "configured",
+          setCredentialValue: () => {},
+          createTool: () => ({
+            description: "stale runtime tool",
+            parameters: {},
+            execute: async () => ({ query: "openclaw", results: [] }),
+          }),
         },
       },
-      sandboxed: true,
-    });
-    await tool?.execute?.(1, { query: "test-config-apikey" });
-
-    expect(mockFetch).toHaveBeenCalled();
-    expect(mockFetch.mock.calls[0]?.[0]).toBe("https://api.perplexity.ai/chat/completions");
-  });
-
-  it("defaults to OpenRouter when apiKey looks like OpenRouter", async () => {
-    const mockFetch = vi.fn(() =>
-      Promise.resolve({
-        ok: true,
-        json: () => Promise.resolve({ choices: [{ message: { content: "ok" } }], citations: [] }),
-      } as Response),
-    );
-    // @ts-expect-error mock fetch
-    global.fetch = mockFetch;
-
-    const tool = createWebSearchTool({
-      config: {
-        tools: {
-          web: {
-            search: {
-              provider: "perplexity",
-              perplexity: { apiKey: "sk-or-v1-test" },
-            },
-          },
+      {
+        pluginId: "fresh-search",
+        pluginName: "Fresh Search",
+        source: "test",
+        provider: {
+          id: "fresh",
+          label: "Fresh Search",
+          hint: "Fresh runtime provider",
+          envVars: [],
+          placeholder: "fresh-...",
+          signupUrl: "https://example.com/fresh",
+          autoDetectOrder: 2,
+          credentialPath: "tools.web.search.fresh.apiKey",
+          getCredentialValue: () => "configured",
+          setCredentialValue: () => {},
+          createTool: () => ({
+            description: "fresh runtime tool",
+            parameters: {},
+            execute: async () => ({ query: "openclaw", results: [] }),
+          }),
         },
       },
-      sandboxed: true,
+    );
+    setActivePluginRegistry(registry);
+    setActiveRuntimeWebToolsMetadata({
+      search: {
+        providerConfigured: "fresh",
+        providerSource: "configured",
+        selectedProvider: "fresh",
+        selectedProviderKeySource: "config",
+        diagnostics: [],
+      },
+      fetch: {
+        providerSource: "none",
+        diagnostics: [],
+      },
+      diagnostics: [],
     });
-    await tool?.execute?.(1, { query: "test-openrouter-config" });
+    const runtimeConfig = {
+      tools: { web: { search: { provider: "fresh", fresh: { apiKey: "runtime-key" } } } },
+    };
+    activeSecretsRuntimeSnapshot.current = { config: runtimeConfig };
 
-    expect(mockFetch).toHaveBeenCalled();
-    expect(mockFetch.mock.calls[0]?.[0]).toBe("https://openrouter.ai/api/v1/chat/completions");
+    const tool = createWebSearchTool({
+      config: { tools: { web: { search: { provider: "stale" } } } },
+      sandboxed: true,
+      runtimeWebSearch: {
+        providerConfigured: "stale",
+        providerSource: "configured",
+        selectedProvider: "stale",
+        selectedProviderKeySource: "config",
+        diagnostics: [],
+      },
+      lateBindRuntimeConfig: true,
+    });
+
+    const result = await tool?.execute?.("call-runtime-provider", { query: "openclaw" });
+
+    expect((result?.details as { provider?: string } | undefined)?.provider).toBe("fresh");
+    expect(runWebSearchCalls).toHaveLength(1);
+    expect(runWebSearchCalls[0]?.config).toBe(runtimeConfig);
+    expect(
+      (runWebSearchCalls[0]?.runtimeWebSearch as { selectedProvider?: string } | undefined)
+        ?.selectedProvider,
+    ).toBe("fresh");
   });
 });

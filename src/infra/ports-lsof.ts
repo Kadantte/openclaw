@@ -1,3 +1,4 @@
+// Uses lsof output to map listening ports to local processes.
 import fs from "node:fs";
 import fsPromises from "node:fs/promises";
 
@@ -17,7 +18,9 @@ async function canExecute(path: string): Promise<boolean> {
 
 export async function resolveLsofCommand(): Promise<string> {
   for (const candidate of LSOF_CANDIDATES) {
-    if (await canExecute(candidate)) return candidate;
+    if (await canExecute(candidate)) {
+      return candidate;
+    }
   }
   return "lsof";
 }

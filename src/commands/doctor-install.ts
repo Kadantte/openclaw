@@ -1,23 +1,28 @@
+/** Doctor warnings for source checkout installs with missing pnpm runtime state. */
 import fs from "node:fs";
 import path from "node:path";
+import { note } from "../../packages/terminal-core/src/note.js";
 
-import { note } from "../terminal/note.js";
-
+/** Emits install warnings when a source checkout looks npm-installed or lacks source-run deps. */
 export function noteSourceInstallIssues(root: string | null) {
-  if (!root) return;
+  if (!root) {
+    return;
+  }
 
+  const srcEntry = path.join(root, "src", "entry.ts");
   const workspaceMarker = path.join(root, "pnpm-workspace.yaml");
-  if (!fs.existsSync(workspaceMarker)) return;
+  if (!fs.existsSync(workspaceMarker) || !fs.existsSync(srcEntry)) {
+    return;
+  }
 
   const warnings: string[] = [];
   const nodeModules = path.join(root, "node_modules");
   const pnpmStore = path.join(nodeModules, ".pnpm");
   const tsxBin = path.join(nodeModules, ".bin", "tsx");
-  const srcEntry = path.join(root, "src", "entry.ts");
 
   if (fs.existsSync(nodeModules) && !fs.existsSync(pnpmStore)) {
     warnings.push(
-      "- node_modules was not installed by pnpm (missing node_modules/.pnpm). Run: pnpm install",
+      "- node_modules was not installed by pnpm (missing node_modules/.pnpm). Run: pnpm install so bundled plugins can load package-local dependencies.",
     );
   }
 
@@ -28,7 +33,7 @@ export function noteSourceInstallIssues(root: string | null) {
   }
 
   if (fs.existsSync(srcEntry) && !fs.existsSync(tsxBin)) {
-    warnings.push("- tsx binary is missing for source runs. Run: pnpm install");
+    warnings.push("- tsx binary is missing for source runs. Run: pnpm install.");
   }
 
   if (warnings.length > 0) {

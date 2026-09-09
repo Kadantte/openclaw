@@ -1,23 +1,26 @@
-export type OpenClawVersion = {
-  major: number;
-  minor: number;
-  patch: number;
-  revision: number;
-};
+// Normalizes config version metadata and compatibility comparisons.
+import { parse as parseSemver, type SemVer } from "semver";
+import {
+  compareOpenClawSemver,
+  isOpenClawCorrectionSemver,
+  normalizeLegacyDotBetaVersion,
+} from "../infra/semver.js";
 
-const VERSION_RE = /^v?(\d+)\.(\d+)\.(\d+)(?:-(\d+))?/;
+/** Parses stable, prerelease, and legacy dot-beta OpenClaw versions. */
+function parseOpenClawVersion(raw: string | null | undefined): SemVer | null {
+  if (!raw) {
+    return null;
+  }
+  const normalized = normalizeLegacyDotBetaVersion(raw.trim());
+  return parseSemver(normalized);
+}
 
-export function parseOpenClawVersion(raw: string | null | undefined): OpenClawVersion | null {
-  if (!raw) return null;
-  const match = raw.trim().match(VERSION_RE);
-  if (!match) return null;
-  const [, major, minor, patch, revision] = match;
-  return {
-    major: Number.parseInt(major, 10),
-    minor: Number.parseInt(minor, 10),
-    patch: Number.parseInt(patch, 10),
-    revision: revision ? Number.parseInt(revision, 10) : 0,
-  };
+export function normalizeOpenClawVersionBase(raw: string | null | undefined): string | null {
+  const parsed = parseOpenClawVersion(raw);
+  if (!parsed) {
+    return null;
+  }
+  return `${parsed.major}.${parsed.minor}.${parsed.patch}`;
 }
 
 export function compareOpenClawVersions(
@@ -26,10 +29,24 @@ export function compareOpenClawVersions(
 ): number | null {
   const parsedA = parseOpenClawVersion(a);
   const parsedB = parseOpenClawVersion(b);
-  if (!parsedA || !parsedB) return null;
-  if (parsedA.major !== parsedB.major) return parsedA.major < parsedB.major ? -1 : 1;
-  if (parsedA.minor !== parsedB.minor) return parsedA.minor < parsedB.minor ? -1 : 1;
-  if (parsedA.patch !== parsedB.patch) return parsedA.patch < parsedB.patch ? -1 : 1;
-  if (parsedA.revision !== parsedB.revision) return parsedA.revision < parsedB.revision ? -1 : 1;
-  return 0;
+  if (!parsedA || !parsedB) {
+    return null;
+  }
+  return compareOpenClawSemver(parsedA, parsedB);
+}
+
+export function shouldWarnOnTouchedVersion(
+  current: string | null | undefined,
+  touched: string | null | undefined,
+): boolean {
+  const parsedCurrent = parseOpenClawVersion(current);
+  const parsedTouched = parseOpenClawVersion(touched);
+  if (parsedCurrent && parsedTouched && parsedCurrent.compareMain(parsedTouched) === 0) {
+    if (parsedTouched.prerelease.length === 0 || isOpenClawCorrectionSemver(parsedTouched)) {
+      return false;
+    }
+  }
+  return parsedCurrent !== null && parsedTouched !== null
+    ? compareOpenClawSemver(parsedCurrent, parsedTouched) < 0
+    : false;
 }

@@ -1,7 +1,7 @@
+// Slash command docs tests validate documented slash command references.
 import fs from "node:fs/promises";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-
 import { listChatCommands } from "../auto-reply/commands-registry.js";
 import { setActivePluginRegistry } from "../plugins/runtime.js";
 import { createTestRegistry } from "../test-utils/channel-plugins.js";

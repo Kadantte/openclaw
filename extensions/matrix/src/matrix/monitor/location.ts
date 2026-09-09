@@ -1,10 +1,11 @@
-import type { LocationMessageEventContent } from "@vector-im/matrix-bot-sdk";
-
+// Matrix plugin module implements location behavior.
+import { parseStrictFiniteNumber } from "openclaw/plugin-sdk/number-runtime";
 import {
-  formatLocationText,
-  toLocationContext,
-  type NormalizedLocation,
-} from "openclaw/plugin-sdk";
+  normalizeLowercaseStringOrEmpty,
+  normalizeOptionalString,
+} from "openclaw/plugin-sdk/string-coerce-runtime";
+import type { LocationMessageEventContent } from "../sdk.js";
+import { formatLocationText, toLocationContext, type NormalizedLocation } from "./runtime-api.js";
 import { EventType } from "./types.js";
 
 export type MatrixLocationPayload = {
@@ -18,38 +19,61 @@ type GeoUriParams = {
   accuracy?: number;
 };
 
+function decodeGeoUriParamValue(value: string): string {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
+  }
+}
+
 function parseGeoUri(value: string): GeoUriParams | null {
   const trimmed = value.trim();
-  if (!trimmed) return null;
-  if (!trimmed.toLowerCase().startsWith("geo:")) return null;
+  if (!trimmed) {
+    return null;
+  }
+  if (!normalizeLowercaseStringOrEmpty(trimmed).startsWith("geo:")) {
+    return null;
+  }
   const payload = trimmed.slice(4);
   const [coordsPart, ...paramParts] = payload.split(";");
+  if (!coordsPart) {
+    return null;
+  }
   const coords = coordsPart.split(",");
-  if (coords.length < 2) return null;
-  const latitude = Number.parseFloat(coords[0] ?? "");
-  const longitude = Number.parseFloat(coords[1] ?? "");
-  if (!Number.isFinite(latitude) || !Number.isFinite(longitude)) return null;
+  if (coords.length < 2) {
+    return null;
+  }
+  const latitude = parseStrictFiniteNumber(coords[0] ?? "");
+  const longitude = parseStrictFiniteNumber(coords[1] ?? "");
+  if (latitude === undefined || longitude === undefined) {
+    return null;
+  }
 
   const params = new Map<string, string>();
   for (const part of paramParts) {
     const segment = part.trim();
-    if (!segment) continue;
+    if (!segment) {
+      continue;
+    }
     const eqIndex = segment.indexOf("=");
     const rawKey = eqIndex === -1 ? segment : segment.slice(0, eqIndex);
     const rawValue = eqIndex === -1 ? "" : segment.slice(eqIndex + 1);
-    const key = rawKey.trim().toLowerCase();
-    if (!key) continue;
+    const key = normalizeLowercaseStringOrEmpty(rawKey);
+    if (!key) {
+      continue;
+    }
     const valuePart = rawValue.trim();
-    params.set(key, valuePart ? decodeURIComponent(valuePart) : "");
+    params.set(key, valuePart ? decodeGeoUriParamValue(valuePart) : "");
   }
 
   const accuracyRaw = params.get("u");
-  const accuracy = accuracyRaw ? Number.parseFloat(accuracyRaw) : undefined;
+  const accuracy = accuracyRaw ? parseStrictFiniteNumber(accuracyRaw) : undefined;
 
   return {
     latitude,
     longitude,
-    accuracy: Number.isFinite(accuracy) ? accuracy : undefined,
+    accuracy,
   };
 }
 
@@ -61,12 +85,18 @@ export function resolveMatrixLocation(params: {
   const isLocation =
     eventType === EventType.Location ||
     (eventType === EventType.RoomMessage && content.msgtype === EventType.Location);
-  if (!isLocation) return null;
-  const geoUri = typeof content.geo_uri === "string" ? content.geo_uri.trim() : "";
-  if (!geoUri) return null;
+  if (!isLocation) {
+    return null;
+  }
+  const geoUri = normalizeOptionalString(content.geo_uri) ?? "";
+  if (!geoUri) {
+    return null;
+  }
   const parsed = parseGeoUri(geoUri);
-  if (!parsed) return null;
-  const caption = typeof content.body === "string" ? content.body.trim() : "";
+  if (!parsed) {
+    return null;
+  }
+  const caption = normalizeOptionalString(content.body) ?? "";
   const location: NormalizedLocation = {
     latitude: parsed.latitude,
     longitude: parsed.longitude,

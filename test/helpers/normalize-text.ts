@@ -1,27 +1,9 @@
-function stripAnsi(input: string): string {
-  let out = "";
-  for (let i = 0; i < input.length; i++) {
-    const code = input.charCodeAt(i);
-    if (code !== 27) {
-      out += input[i];
-      continue;
-    }
+// Text normalization helper strips terminal control sequences from test output.
+import { stripAnsi } from "../../packages/terminal-core/src/ansi.js";
 
-    const next = input[i + 1];
-    if (next !== "[") continue;
-    i += 1;
+// Snapshot text normalization for terminal output tests.
 
-    while (i + 1 < input.length) {
-      i += 1;
-      const c = input[i];
-      if (!c) break;
-      const isLetter = (c >= "A" && c <= "Z") || (c >= "a" && c <= "z") || c === "~";
-      if (isLetter) break;
-    }
-  }
-  return out;
-}
-
+/** Strip ANSI, normalize line endings, ellipses, and emoji/surrogate pairs. */
 export function normalizeTestText(input: string): string {
   return stripAnsi(input)
     .replaceAll("\r\n", "\n")
